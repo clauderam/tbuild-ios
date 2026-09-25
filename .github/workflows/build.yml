@@ -1,46 +1,77 @@
-name: CI
+name: iOS build
 
-on:
+# Build branches are the bare app slug, so the trigger cannot be a positive
+# pattern like "app/**" any more. branches and branches-ignore are mutually
+# exclusive, so ignore the only two branches in the build fork that must never
+# produce a build: the default branch and this runner's immutable build base.
+#
+# Coupling to remember: renaming the fork's default branch means updating
+# tbuild-actions' embedded workflow and re-bootstrapping the base branch.
+# Legacy "app/<slug>" branches still match, so nothing in flight is orphaned.
+"on":
   push:
-    branches: [ master ]
+    branches-ignore:
+      - "master"
+      - "tbuild-ios-base"
 
-  workflow_dispatch:
-
+# The source/build job is read-only. Only the isolated publish job receives
+# contents:write, and it never checks out or executes source-controlled code.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: tbuild-actions-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      app_name: ${{ steps.metadata.outputs.app_name }}
+      app_version: ${{ steps.metadata.outputs.app_version }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+    env:
+      SOURCE_DIR: /Users/Shared/telegram-ios
+      BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout app branch without persisted credentials
+        uses: actions/checkout@v5
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+          submodules: recursive
+          fetch-depth: "0"
+          persist-credentials: false
 
-      - name: Set active Xcode path
+      - name: Select pinned Xcode
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          set -euo pipefail
+          XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
-      - name: Create canonical source directory
+      - name: Prepare canonical source directory
         run: |
-          set -x
+          set -euo pipefail
           sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
-      
-      - name: Apply branding and custom datacenter
+          rm -rf "$SOURCE_DIR"
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename "$GITHUB_WORKSPACE")" "$SOURCE_DIR"
+          # The checkout has no persisted write credential. Keep .git only for
+          # the build number/revision commands; never expose a token to source.
+
+      - name: Apply branding and datacenter
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          cd "$SOURCE_DIR"
           python3 build-system/apply_branding.py build-system/branding/branding.json
-      
-      - name: Regenerate provisioning profiles for bundle id
+
+      - name: Regenerate provisioning profiles
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          rm -rf build-system/fake-codesigning/profiles-backup
           cp -R build-system/fake-codesigning/profiles build-system/fake-codesigning/profiles-backup
           python3 build-system/Make/RegenerateProfilesForBundleId.py \
             --configurationPath=build-system/appstore-configuration.json \
@@ -48,144 +79,102 @@ jobs:
             --destinationProfiles=build-system/fake-codesigning/profiles \
             --certsPath=build-system/fake-codesigning/certs
 
-      - name: Normalize & Generate App Icons
+      - name: Generate app icons
         run: |
-          python3 -m pip install --upgrade --break-system-packages Pillow
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          python3 -m pip install --upgrade --break-system-packages Pillow==11.3.0
+          cd "$SOURCE_DIR"
           python3 build-system/generate_icons.py
 
-      - name: Build the App
+      - name: Build and verify IPA
+        id: metadata
         run: |
-          set -x
+          set -euo pipefail
+          cd "$SOURCE_DIR"
 
-          # source code paths are included in the final binary, so we need to make them stable across builds
-          SOURCE_DIR=/Users/Shared/telegram-ios
-
-          # use canonical bazel root
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-
-          cd $SOURCE_DIR
-
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
-          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
+          export APP_VERSION
+          APP_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+          APP_NAME=$(python3 -c 'import json; print(json.load(open("build-system/branding/branding.json"))["general"]["app_name"])')
+          printf 'APP_VERSION=%s\nBUILD_NUMBER=%s\n' "$APP_VERSION" "$BUILD_NUMBER" >> "$GITHUB_ENV"
+          printf 'app_name=%s\napp_version=%s\nbuild_number=%s\n' "$APP_NAME" "$APP_VERSION" "$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
-            --configurationPath="build-system/appstore-configuration.json" \
+            --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # collect ipa
-          OUTPUT_PATH="build/artifacts"
+          OUTPUT_PATH=build/artifacts
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
           IPA_FOUND=0
-          for f in bazel-bin/Telegram/Telegram.ipa \
-                   bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa \
-                   bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            if [ -f "$f" ]; then
-              echo "Found IPA at: $f"
-              cp "$f" "$OUTPUT_PATH/"
+          for candidate in \
+            bazel-bin/Telegram/Telegram.ipa \
+            bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa \
+            bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" "$OUTPUT_PATH/Telegram.ipa"
               IPA_FOUND=1
               break
             fi
           done
 
-          if [ $IPA_FOUND -eq 0 ]; then
-            echo "ERROR: IPA file not found!"
-            echo "Searching in bazel-bin:"
-            ls -la bazel-bin/Telegram/ || echo "No bazel-bin/Telegram/"
-            echo "Searching in bazel-out:"
-            find bazel-out -name "*.ipa" 2>/dev/null || echo "No ipa found"
+          if [ "$IPA_FOUND" -ne 1 ]; then
+            echo "ERROR: the build completed but no Telegram.ipa was found" >&2
+            find bazel-bin bazel-out -name '*.ipa' -type f -print 2>/dev/null || true
             exit 1
           fi
+          test "$(wc -c < "$OUTPUT_PATH/Telegram.ipa")" -gt 1048576
+          unzip -tq "$OUTPUT_PATH/Telegram.ipa"
+          ls -lh "$OUTPUT_PATH/Telegram.ipa"
 
-          # collect dsym
-          mkdir -p build/DSYMs
-          if [ -d "bazel-bin/Telegram" ]; then
-            for f in bazel-bin/Telegram/*.dSYM; do
-              if [ -d "$f" ]; then
-                echo "Copying dSYM: $f"
-                cp -R "$f" build/DSYMs/
-              fi
-            done
-          fi
-          
-          if [ -z "$(ls -A build/DSYMs 2>/dev/null)" ]; then
-            for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
-              if [ -d "$f" ]; then
-                echo "Copying dSYM from bazel-out: $f"
-                cp -R "$f" build/DSYMs/
-              fi
-            done
-          fi
-          
-          if [ -z "$(ls -A build/DSYMs 2>/dev/null)" ]; then
-            echo "WARNING: No dSYM files found!"
-          else
-            echo "Found dSYM files:"
-            ls -la build/DSYMs/
-          fi
-          
-          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
-          echo "Build artifacts collected successfully!"
-          echo "Contents of $OUTPUT_PATH:"
-          ls -la "$OUTPUT_PATH/"
+      - name: Upload IPA to the workflow artifact store
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/artifacts/Telegram.ipa
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Prepare unique release tag
-        run: |
-          set -x
-          REF="$(echo "${{ github.ref_name }}" | tr '/' '-')"
-          # Uniqueness per run: run_id + run_attempt guarantee a fresh tag every
-          # run, so a release is always created and previously published releases
-          # are never overwritten or deleted.
-          RELEASE_TAG="build-${REF}-${{ env.BUILD_NUMBER }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_ENV
-          echo "release tag: ${RELEASE_TAG}"
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the verified IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: publish
 
-      - name: Create GitHub Release
+      - name: Publish IPA release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          APP_NAME: ${{ needs.build.outputs.app_name }}
+          APP_VERSION: ${{ needs.build.outputs.app_version }}
+          BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
-
-          RELEASE_TAG="${{ env.RELEASE_TAG }}"
-          REL_TITLE="Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})"
-          REL_NOTES="An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})"
-
-          # Attach only the artifacts that actually exist. dSYMs stay out of the
-          # release upload.
-          ASSETS=()
-          for asset in "build/artifacts/Telegram.ipa"; do
-            if [ -f "$asset" ]; then
-              ASSETS+=("$asset")
-            else
-              echo "WARNING: missing artifact, skipping: $asset"
-            fi
-          done
-
-          # Retry transient API failures; fail loudly only after 3 attempts.
-          n=0
-          until gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+          set -euo pipefail
+          test -s publish/Telegram.ipa
+          REF=${GITHUB_REF_NAME//\//-}
+          RELEASE_TAG="build-${REF}-${BUILD_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          attempt=1
+          until gh release create "$RELEASE_TAG" publish/Telegram.ipa \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "$REL_TITLE" \
-            --notes "$REL_NOTES"; do
-            n=$((n+1))
-            if [ "$n" -ge 3 ]; then
-              echo "ERROR: failed to create release after $n attempts" >&2
+            --title "$APP_NAME $APP_VERSION ($BUILD_NUMBER)" \
+            --notes "iOS build $APP_VERSION ($BUILD_NUMBER) for $GITHUB_REF_NAME"; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "ERROR: release creation failed after $attempt attempts" >&2
               exit 1
             fi
-            echo "release create attempt #$n failed, retrying in 10s"
+            attempt=$((attempt + 1))
             sleep 10
           done
