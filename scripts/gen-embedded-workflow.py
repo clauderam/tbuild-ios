@@ -111,21 +111,41 @@ if not dropped_keys:
 note = """  # This copy is generated from the default branch's .github/workflows/build.yml
   # by scripts/gen-embedded-workflow.py. Edit that file, then regenerate.
   #
-  # It differs from the default branch's copy in exactly one way: it has no
-  # workflow_dispatch. The tbuild-actions service only reconciles push-triggered
-  # runs with a job, so a manual dispatch on an app branch would start a build
-  # nothing tracks. The default branch is excluded from push builds and keeps
-  # its dispatch, and is also the only place the golden and keepalive jobs can
-  # ever run.
+  # It differs from the default branch's copy in that it has no workflow_dispatch,
+  # drops the golden and keepalive jobs, and drops the env keys only the seed
+  # consults. The tbuild-actions service reconciles only push-triggered runs with
+  # a job, so a manual dispatch on an app branch would start a build nothing
+  # tracks. Job conditions that tested a dispatch input are reduced to their
+  # push-and-schedule part for the same reason.
 """
 lines.insert(1, note)
 
+# A build branch only ever sees push or schedule, so a condition that tests a
+# dispatch input is dead there. Reduce those two conditions to their push and
+# schedule part rather than leaving a reference to an input this file does not
+# define, which actionlint rejects and which would be misleading to a reader.
+CONDITION_REWRITES = [
+    ("    if: github.event_name != 'schedule' && !inputs.probe_only\n",
+     "    if: github.event_name != 'schedule'\n"),
+    ("    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.probe_only)\n",
+     "    if: github.event_name == 'schedule'\n"),
+]
+for old, new in CONDITION_REWRITES:
+    if old in "".join(lines):
+        lines = [new if l == old else l for l in lines]
+
 out = "".join(lines)
+if "inputs." in out:
+    raise SystemExit("template still references a dispatch input: %s"
+                     % [l.strip() for l in lines if "inputs." in l])
 OUT.write_text(out)
 
 # the deletions above are the whole point, so assert them
-for gone in ("workflow_dispatch:", "seed_cache", "  golden:", "  keepalive:",
-             "MIN_CAS_KB", "MAX_CAS_KB", "MAX_REPOS_KB", "QUOTA_BYTES", "QUOTA_GIB"):
+# Check for these as YAML keys or job headers, not as bare words. A prose
+# mention of "seed_cache" in a comment is not the input surviving into the
+# template, and treating it as one produced a false failure here.
+for gone in ("workflow_dispatch:", "seed_cache:", "probe_only:", "  golden:", "  keepalive:",
+             "MIN_CAS_KB:", "MAX_CAS_KB:", "MAX_REPOS_KB:", "QUOTA_BYTES:", "QUOTA_GIB:"):
     if gone in out:
         raise SystemExit("expected %r to be absent from the template" % gone)
 for kept in (
@@ -179,7 +199,21 @@ if shared(src_doc.get("env", {})) != out_doc.get("env", {}):
     raise SystemExit("template changed or dropped a shared env entry")
 
 for job in ("build", "publish"):
-    if src_doc["jobs"][job] != out_doc["jobs"].get(job):
+    src_job = dict(src_doc["jobs"][job])
+    out_job = dict(out_doc["jobs"].get(job, {}))
+    if job == "build":
+        # The one intended difference: the build condition loses its dispatch
+        # test. Assert both that it changed and that it changed to the expected
+        # reduction, so a silent drift in either is still a failure.
+        expected = "github.event_name != 'schedule'"
+        if src_job.get("if") == out_job.get("if"):
+            raise SystemExit("build job condition was not reduced for build branches")
+        if out_job.get("if") != expected:
+            raise SystemExit("build job condition became %r, expected %r"
+                             % (out_job.get("if"), expected))
+        src_job.pop("if", None)
+        out_job.pop("if", None)
+    if src_job != out_job:
         raise SystemExit("template changed the %s job; a build branch would no longer run the same steps" % job)
 extra = set(out_doc["jobs"]) - {"build", "publish"}
 if extra:

@@ -2,12 +2,12 @@ name: iOS build
   # This copy is generated from the default branch's .github/workflows/build.yml
   # by scripts/gen-embedded-workflow.py. Edit that file, then regenerate.
   #
-  # It differs from the default branch's copy in exactly one way: it has no
-  # workflow_dispatch. The tbuild-actions service only reconciles push-triggered
-  # runs with a job, so a manual dispatch on an app branch would start a build
-  # nothing tracks. The default branch is excluded from push builds and keeps
-  # its dispatch, and is also the only place the golden and keepalive jobs can
-  # ever run.
+  # It differs from the default branch's copy in that it has no workflow_dispatch,
+  # drops the golden and keepalive jobs, and drops the env keys only the seed
+  # consults. The tbuild-actions service reconciles only push-triggered runs with
+  # a job, so a manual dispatch on an app branch would start a build nothing
+  # tracks. Job conditions that tested a dispatch input are reduced to their
+  # push-and-schedule part for the same reason.
 
 # This file is the single source of truth for every build in the runner, and it
 # is mirrored byte-for-byte into the tbuild-actions service as its embedded
@@ -61,6 +61,8 @@ jobs:
   # entry is golden, below.
   # ---------------------------------------------------------------------------
   build:
+    # A probe-only dispatch is the cache wiring check and must not drag a
+    # full compile behind it; seed_cache deliberately does build.
     if: github.event_name != 'schedule'
     runs-on: macos-latest
     timeout-minutes: 180
@@ -87,16 +89,34 @@ jobs:
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
       # Cache handling is strictly best-effort and must never be able to fail a
-      # build. A missing entry, a truncated download, a stale generation or a
-      # half-written directory all end the same way: the directory is discarded
-      # and bazel compiles the whole tree exactly as it did before any of this
-      # existed. continue-on-error covers a failing restore step, and the scrub
-      # below covers a restore that "succeeds" with unusable content.
+      # build. A missing entry, a truncated download, an entry evicted by the
+      # 7-day policy, a generation left by an older layout and a half-written
+      # directory all end the same way: the build compiles the whole tree exactly
+      # as it did before any of this existed.
       #
-      # lookup-only keeps the post-job save from firing, so these steps are the
-      # only thing that can ever touch the cache here. The key is derived from
-      # files that are byte-identical on every branch, so all builders share one
-      # entry and an upstream bump rotates it for everyone at once.
+      # This step MUST NOT set lookup-only. Despite the name, lookup-only makes
+      # actions/cache find the entry, report cache-hit: 'true', and then skip the
+      # download: the log says "Lookup only - skipping download". A build wired
+      # that way silently compiles from scratch while every step reports success,
+      # which is exactly what happened once already, and cost a 65-minute build
+      # that reported cache-hit: 'true' the whole way.
+      #
+      # actions/cache/restore arms a post-job save when it misses, and there is
+      # no setting that downloads without arming one. So a build must be stopped
+      # from writing some other way, and that is what the "Release restored
+      # cache" step below does: it empties both paths before the job's post-job
+      # steps run, so there is nothing to upload. An entry is write-once, so a
+      # branded or partial cache saved by a builder would permanently shadow the
+      # real golden for every future build.
+      #
+      # cache-mode: read was tried here as a second, platform-level guard and
+      # removed: the first build with it failed the publish job with
+      # "HTTP 403: Resource not accessible by integration" on the releases API,
+      # while the publish job's own permissions were unchanged. Do not reintroduce
+      # it without a full build plus publish to prove it is inert.
+      #
+      # The key is derived from files that are byte-identical on every branch, so
+      # all builders share one entry and an upstream bump rotates it at once.
       - name: Restore golden bazel disk cache
         id: restore_cas
         continue-on-error: true
@@ -106,7 +126,6 @@ jobs:
           key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-cas-v1-${{ runner.os }}-
-          lookup-only: true
 
       - name: Restore golden external repository cache
         id: restore_repos
@@ -117,37 +136,42 @@ jobs:
           key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-repos-v1-${{ runner.os }}-
-          lookup-only: true
 
-      # Discard anything that is not a usable cache of the expected shape.
-      # bazel lays its disk cache out as ac/ and cas/, and its repository cache
-      # as content_addressable/. Anything else - a partial extraction, an empty
-      # directory left by a failed restore, a stale generation from a different
-      # layout - is removed here so the build simply compiles from scratch.
-      - name: Discard unusable cache content
+      # Report what the restore actually produced. This deliberately does not
+      # delete anything: a wrong guess about the cache layout must cost a slow
+      # build, never a silently discarded download. The two failure shapes worth
+      # shouting about are a hit that produced no usable directory, and content
+      # in an unexpected shape - both are bugs here, not conditions to absorb.
+      - name: Report restored cache content
+        id: scrub
         continue-on-error: true
         run: |
           set -euo pipefail
-          echo "disk cache hit:  '${{ steps.restore_cas.outputs.cache-hit }}'"
-          echo "repos cache hit: '${{ steps.restore_repos.outputs.cache-hit }}'"
+          cas_hit="${{ steps.restore_cas.outputs.cache-hit }}"
+          repos_hit="${{ steps.restore_repos.outputs.cache-hit }}"
+          echo "disk cache hit:  '$cas_hit'"
+          echo "repos cache hit: '$repos_hit'"
 
-          scrub() {
-            dir="$1"; marker_a="$2"; marker_b="$3"; label="$4"
-            if [ ! -e "$dir" ]; then
-              echo "$label: absent, compiling from scratch"
+          # $1 dir, $2 expected subdir, $3 label, $4 whether a hit was reported
+          inspect() {
+            dir="$1"; marker="$2"; label="$3"; hit="$4"
+            if [ ! -d "$dir" ]; then
+              if [ "$hit" = "true" ]; then
+                echo "::error::$label reported a cache hit but $dir does not exist - the entry was matched and never downloaded, so this build is compiling from scratch"
+              else
+                echo "$label: absent, no entry to restore; compiling from scratch"
+              fi
               return 0
             fi
             size_kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
-            if [ -d "$dir/$marker_a" ] || [ -d "$dir/$marker_b" ]; then
-              echo "$label: usable, $((size_kb / 1024)) MiB"
-              return 0
+            echo "$label: $((size_kb / 1024)) MiB, top level: $(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
+            if [ ! -d "$dir/$marker" ]; then
+              echo "::error::$label at $dir has no $marker/ directory. Leaving it in place rather than deleting a possibly-valid download; if bazel misses, the layout assumption in this step is wrong and needs fixing."
             fi
-            echo "::warning::$label at $dir is not a usable cache ($((size_kb / 1024)) MiB, no $marker_a/ or $marker_b/); discarding it"
-            rm -rf "${dir:?}"
           }
 
-          scrub "$BAZEL_CACHE_DIR" cas ac "bazel disk cache"
-          scrub "$REPO_CACHE_DIR" content_addressable repo_toolchains "external repository cache"
+          inspect "$BAZEL_CACHE_DIR" cas "bazel disk cache" "$cas_hit"
+          inspect "$REPO_CACHE_DIR" content_addressable "external repository cache" "$repos_hit"
 
       - name: Prepare canonical source directory
         run: |
@@ -263,6 +287,25 @@ jobs:
           path: build/artifacts/${{ steps.metadata.outputs.ipa_name }}
           if-no-files-found: error
           retention-days: 1
+
+      # The IPA is built and the cache has served its purpose, so empty both
+      # cache paths before the job's post-job steps run. This is the ONLY thing
+      # stopping a builder from writing the golden, and it is verified: after a
+      # build restored 1.5 GiB and released 7.0 GiB, the repository still held
+      # exactly the two seeded entries. The runner is discarded either way, so
+      # releasing the cache costs nothing.
+      - name: Release restored cache
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for dir in "$BAZEL_CACHE_DIR" "$REPO_CACHE_DIR"; do
+            if [ -d "$dir" ]; then
+              du -sh "$dir" 2>/dev/null | sed 's/^/  releasing /'
+              rm -rf "${dir:?}"
+            fi
+          done
+          echo "cache paths emptied; nothing left for a post-job save to upload"
 
   # ---------------------------------------------------------------------------
   publish:
