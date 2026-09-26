@@ -25,12 +25,24 @@ on:
       - "tbuild-ios-base"
 
   # Manual trigger. The default branch no longer builds on push, so this is how
-  # a build is started there. Leave seed_cache off for a normal build; turn it
-  # on to additionally rebuild the shared golden cache.
+  # a build is started there. The three dispatch modes on the default branch:
+  #
+  #   probe_only   restore both golden entries, report whether they arrived,
+  #                empty the paths, exit. About two minutes, no compilation.
+  #                This is the cheap end-to-end check of the cache wiring.
+  #   seed_cache   compile the unbranded tree and save a new golden generation.
+  #                A full compile, and deliberately cold.
+  #   neither      an ordinary branded build of this branch, with a release.
+  #
+  # seed_cache wins if both are set, since a seed is a build too.
   workflow_dispatch:
     inputs:
       seed_cache:
-        description: "Also rebuild the shared golden cache from the unbranded tree"
+        description: "Rebuild the shared golden cache from the unbranded tree (a full cold compile)"
+        type: boolean
+        default: false
+      probe_only:
+        description: "Only restore the golden caches and report, without building"
         type: boolean
         default: false
 
@@ -81,7 +93,9 @@ jobs:
   # entry is golden, below.
   # ---------------------------------------------------------------------------
   build:
-    if: github.event_name != 'schedule'
+    # A probe-only dispatch is the cache wiring check and must not drag a
+    # full compile behind it; seed_cache deliberately does build.
+    if: github.event_name != 'schedule' && !inputs.probe_only
     runs-on: macos-latest
     timeout-minutes: 180
     permissions:
@@ -554,7 +568,10 @@ jobs:
     # Also dispatchable, which makes it the cheap end-to-end probe for cache
     # wiring: it restores both entries, prints whether they arrived, empties the
     # paths and exits, without compiling anything.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Weekly keepalive, or an on-demand probe. Not on an ordinary build dispatch:
+    # the build job restores the same entries, so the access clock is refreshed
+    # anyway and the probe would be a redundant 1.5 GiB download.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.probe_only)
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
