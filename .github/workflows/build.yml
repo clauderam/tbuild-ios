@@ -45,6 +45,14 @@ on:
 permissions:
   contents: read
 
+# One run at a time across the whole runner. The tbuild-actions service already
+# serialises its queue and refuses to start a later job before the previous run
+# is terminal; this is the second line of defence, and it also keeps a cache
+# rotation from overlapping a build that is reading the same cache.
+concurrency:
+  group: tbuild-actions-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   SOURCE_DIR: /Users/Shared/telegram-ios
   BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
@@ -79,10 +87,6 @@ jobs:
       build_number: ${{ steps.metadata.outputs.build_number }}
       ipa_name: ${{ steps.metadata.outputs.ipa_name }}
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
-    concurrency:
-      group: tbuild-build-${{ github.repository }}-${{ github.ref }}
-      cancel-in-progress: false
-
     steps:
       - name: Checkout app branch without persisted credentials
         uses: actions/checkout@v5
@@ -257,10 +261,6 @@ jobs:
       # Only this job creates or removes cache entries, so it is the only one
       # that needs an actions token with write access.
       actions: write
-    concurrency:
-      group: tbuild-golden-${{ github.repository }}
-      cancel-in-progress: false
-
     steps:
       - name: Checkout without persisted credentials
         uses: actions/checkout@v5
@@ -416,10 +416,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    concurrency:
-      group: tbuild-keepalive-${{ github.repository }}
-      cancel-in-progress: false
-
     steps:
       - name: Checkout for key computation
         uses: actions/checkout@v5
@@ -448,10 +444,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-    concurrency:
-      group: tbuild-publish-${{ github.repository }}-${{ github.ref }}
-      cancel-in-progress: false
-
     steps:
       - name: Download the verified IPA
         uses: actions/download-artifact@v4
