@@ -1,30 +1,66 @@
 name: iOS build
+  # This copy is generated from the default branch's .github/workflows/build.yml
+  # by scripts/gen-embedded-workflow.py. Edit that file, then regenerate.
+  #
+  # It differs from the default branch's copy in exactly one way: it has no
+  # workflow_dispatch. The tbuild-actions service only reconciles push-triggered
+  # runs with a job, so a manual dispatch on an app branch would start a build
+  # nothing tracks. The default branch is excluded from push builds and keeps
+  # its dispatch, and is also the only place the golden and keepalive jobs can
+  # ever run.
 
-# Build branches are the bare app slug, so the trigger cannot be a positive
-# pattern like "app/**" any more. branches and branches-ignore are mutually
-# exclusive, so ignore the only two branches in the build fork that must never
-# produce a build: the default branch and this runner's immutable build base.
+# This file is the single source of truth for every build in the runner, and it
+# is mirrored byte-for-byte into the tbuild-actions service as its embedded
+# template (/opt/tbuild-actions/build-workflow.yml). The service rewrites
+# .github/workflows/build.yml on every app-branch job, so editing a build
+# branch by hand is pointless: change it here and in the template together.
 #
-# Coupling to remember: renaming the fork's default branch means updating
-# tbuild-actions' embedded workflow and re-bootstrapping the base branch.
-# Legacy "app/<slug>" branches still match, so nothing in flight is orphaned.
-"on":
+# The service rebuilds every app branch from tbuild-ios-base, overriding only
+# .github/workflows/build.yml and build-system/branding/{branding.json,
+# logo.png,server_rsa.pub}. Everything else a build branch contains comes from
+# the base tree, which is the default branch pinned by TBUILD_SOURCE_SHA.
+#
+# Every job below builds the same tree in the same absolute location and pins
+# the same toolchain, so the bazel action keys are comparable across branches
+# and one cache seeded from the default branch can serve all of them.
+on:
   push:
+    # App branches are bare slugs, so the trigger cannot be a positive pattern
+    # and the exclusion list has to name the two non-build branches: the
+    # default branch and the runner's immutable build base. The service's own
+    # workflow_test.go asserts exactly these two entries.
     branches-ignore:
       - "master"
       - "tbuild-ios-base"
 
-# The source/build job is read-only. Only the isolated publish job receives
-# contents:write, and it never checks out or executes source-controlled code.
 permissions:
   contents: read
 
+# One run at a time across the whole runner. The tbuild-actions service already
+# serialises its queue and refuses to start a later job before the previous run
+# is terminal; this is the second line of defence, and it also keeps a cache
+# rotation from overlapping a build that is reading the same cache.
 concurrency:
   group: tbuild-actions-${{ github.repository }}
   cancel-in-progress: false
 
+env:
+  SOURCE_DIR: /Users/Shared/telegram-ios
+  BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+  # Both cache directories live outside SOURCE_DIR so bazel never treats them
+  # as part of the source tree. Their absolute paths are part of the contract:
+  # the save and the restore must agree on them.
+  BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
+  REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
 jobs:
+  # ---------------------------------------------------------------------------
+  # Branded build. Restores the golden caches and never writes them: it only
+  # ever uses actions/cache/restore with lookup-only, so no post-job save can
+  # fire, and it contains no save step at all. The only job that creates a cache
+  # entry is golden, below.
+  # ---------------------------------------------------------------------------
   build:
+    if: github.event_name != 'schedule'
     runs-on: macos-latest
     timeout-minutes: 180
     permissions:
@@ -33,10 +69,8 @@ jobs:
       app_name: ${{ steps.metadata.outputs.app_name }}
       app_version: ${{ steps.metadata.outputs.app_version }}
       build_number: ${{ steps.metadata.outputs.build_number }}
-    env:
-      SOURCE_DIR: /Users/Shared/telegram-ios
-      BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
-
+      ipa_name: ${{ steps.metadata.outputs.ipa_name }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
     steps:
       - name: Checkout app branch without persisted credentials
         uses: actions/checkout@v5
@@ -50,6 +84,69 @@ jobs:
           set -euo pipefail
           XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+
+      # Cache handling is strictly best-effort and must never be able to fail a
+      # build. A missing entry, a truncated download, a stale generation or a
+      # half-written directory all end the same way: the directory is discarded
+      # and bazel compiles the whole tree exactly as it did before any of this
+      # existed. continue-on-error covers a failing restore step, and the scrub
+      # below covers a restore that "succeeds" with unusable content.
+      #
+      # lookup-only keeps the post-job save from firing, so these steps are the
+      # only thing that can ever touch the cache here. The key is derived from
+      # files that are byte-identical on every branch, so all builders share one
+      # entry and an upstream bump rotates it for everyone at once.
+      - name: Restore golden bazel disk cache
+        id: restore_cas
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-cas-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Restore golden external repository cache
+        id: restore_repos
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-repos-v1-${{ runner.os }}-
+          lookup-only: true
+
+      # Discard anything that is not a usable cache of the expected shape.
+      # bazel lays its disk cache out as ac/ and cas/, and its repository cache
+      # as content_addressable/. Anything else - a partial extraction, an empty
+      # directory left by a failed restore, a stale generation from a different
+      # layout - is removed here so the build simply compiles from scratch.
+      - name: Discard unusable cache content
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "disk cache hit:  '${{ steps.restore_cas.outputs.cache-hit }}'"
+          echo "repos cache hit: '${{ steps.restore_repos.outputs.cache-hit }}'"
+
+          scrub() {
+            dir="$1"; marker_a="$2"; marker_b="$3"; label="$4"
+            if [ ! -e "$dir" ]; then
+              echo "$label: absent, compiling from scratch"
+              return 0
+            fi
+            size_kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
+            if [ -d "$dir/$marker_a" ] || [ -d "$dir/$marker_b" ]; then
+              echo "$label: usable, $((size_kb / 1024)) MiB"
+              return 0
+            fi
+            echo "::warning::$label at $dir is not a usable cache ($((size_kb / 1024)) MiB, no $marker_a/ or $marker_b/); discarding it"
+            rm -rf "${dir:?}"
+          }
+
+          scrub "$BAZEL_CACHE_DIR" cas ac "bazel disk cache"
+          scrub "$REPO_CACHE_DIR" content_addressable repo_toolchains "external repository cache"
 
       - name: Prepare canonical source directory
         run: |
@@ -99,11 +196,29 @@ jobs:
           BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
           APP_NAME=$(python3 -c 'import json; print(json.load(open("build-system/branding/branding.json"))["general"]["app_name"])')
           printf 'APP_VERSION=%s\nBUILD_NUMBER=%s\n' "$APP_VERSION" "$BUILD_NUMBER" >> "$GITHUB_ENV"
-          printf 'app_name=%s\napp_version=%s\nbuild_number=%s\n' "$APP_NAME" "$APP_VERSION" "$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Ship the IPA under the brand name from branding.json rather than the
+          # upstream Telegram.ipa. app_name is free-form, so reduce it to a safe
+          # filename and hand the result to the upload and publish steps instead
+          # of letting either re-derive it.
+          IPA_NAME=$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9._-' '_')
+          IPA_NAME="${IPA_NAME%.ipa}"
+          [ -n "$IPA_NAME" ] || IPA_NAME="App"
+          ARTIFACT_NAME="ios-ipa-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          printf 'app_name=%s\napp_version=%s\nbuild_number=%s\nipa_name=%s.ipa\nartifact_name=%s\n' \
+            "$APP_NAME" "$APP_VERSION" "$BUILD_NUMBER" "$IPA_NAME" "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+          # --cacheDir maps to bazel's --disk_cache. Make.py's --bazelArguments
+          # is parsed but never reaches the bazel command line, so the repository
+          # cache goes through the user rc file, which bazel reads after the
+          # workspace one and which nothing in the source tree sets.
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
             build \
             --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
@@ -119,7 +234,7 @@ jobs:
             bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa \
             bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
             if [ -f "$candidate" ]; then
-              cp "$candidate" "$OUTPUT_PATH/Telegram.ipa"
+              cp "$candidate" "$OUTPUT_PATH/$IPA_NAME.ipa"
               IPA_FOUND=1
               break
             fi
@@ -130,20 +245,28 @@ jobs:
             find bazel-bin bazel-out -name '*.ipa' -type f -print 2>/dev/null || true
             exit 1
           fi
-          test "$(wc -c < "$OUTPUT_PATH/Telegram.ipa")" -gt 1048576
-          unzip -tq "$OUTPUT_PATH/Telegram.ipa"
-          ls -lh "$OUTPUT_PATH/Telegram.ipa"
+          test "$(wc -c < "$OUTPUT_PATH/$IPA_NAME.ipa")" -gt 1048576
+          unzip -tq "$OUTPUT_PATH/$IPA_NAME.ipa"
+          ls -lh "$OUTPUT_PATH/$IPA_NAME.ipa"
+
+          # upload-artifact resolves `path` against $GITHUB_WORKSPACE, not
+          # $SOURCE_DIR, so stage the verified IPA there. This is also what makes
+          # if-no-files-found: error a meaningful check.
+          mkdir -p "$GITHUB_WORKSPACE/build/artifacts"
+          cp "$OUTPUT_PATH/$IPA_NAME.ipa" "$GITHUB_WORKSPACE/build/artifacts/$IPA_NAME.ipa"
 
       - name: Upload IPA to the workflow artifact store
         uses: actions/upload-artifact@v4
         with:
-          name: ios-ipa-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/artifacts/Telegram.ipa
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: build/artifacts/${{ steps.metadata.outputs.ipa_name }}
           if-no-files-found: error
           retention-days: 1
 
+  # ---------------------------------------------------------------------------
   publish:
     needs: build
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -151,7 +274,7 @@ jobs:
       - name: Download the verified IPA
         uses: actions/download-artifact@v4
         with:
-          name: ios-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: publish
 
       - name: Publish IPA release
@@ -160,13 +283,14 @@ jobs:
           APP_NAME: ${{ needs.build.outputs.app_name }}
           APP_VERSION: ${{ needs.build.outputs.app_version }}
           BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
+          IPA_NAME: ${{ needs.build.outputs.ipa_name }}
         run: |
           set -euo pipefail
-          test -s publish/Telegram.ipa
+          test -s "publish/$IPA_NAME"
           REF=${GITHUB_REF_NAME//\//-}
           RELEASE_TAG="build-${REF}-${BUILD_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           attempt=1
-          until gh release create "$RELEASE_TAG" publish/Telegram.ipa \
+          until gh release create "$RELEASE_TAG" "publish/$IPA_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$APP_NAME $APP_VERSION ($BUILD_NUMBER)" \
