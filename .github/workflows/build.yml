@@ -61,12 +61,17 @@ env:
   # the save and the restore must agree on them.
   BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
   REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
-  # Budget slices against the 10 GB per-repository cache quota. The two
-  # generated entries are sized independently so the loser of a size overrun
-  # costs a re-download, never the other entry.
+  # Guard rails for the seed, not the quota. These upper bounds only reject
+  # something implausible for a single build. The quota is enforced after the
+  # save, against stored bytes, by the Verify step in the golden job - the one
+  # number that matters is the compressed size, which `du` cannot see.
   MIN_CAS_KB: "262144"    # 256 MiB - below this the build never got going
-  MAX_CAS_KB: "5242880"   # 5 GiB
+  MAX_CAS_KB: "9437184"   # 9 GiB
   MAX_REPOS_KB: "3670016" # 3.5 GiB
+  # GitHub's default Actions cache quota, adjustable in repository settings if a
+  # future upstream bump needs more room. That is far cheaper than self-hosting.
+  QUOTA_BYTES: "10737418240"
+  QUOTA_GIB: "10"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -385,25 +390,36 @@ jobs:
           [ -d "$BAZEL_CACHE_DIR" ] && cas_kb=$(du -sk "$BAZEL_CACHE_DIR" | cut -f1)
           [ -d "$REPO_CACHE_DIR" ] && repos_kb=$(du -sk "$REPO_CACHE_DIR" | cut -f1)
 
+          # Report MiB with a decimal, and the exact KiB, because integer GiB
+          # rounds 5.0 and 5.9 to the same "5" and that is exactly how a
+          # threshold got mis-calibrated against this number once already.
+          mib() { awk -v k="$1" 'BEGIN{printf "%.0f", k/1024}'; }
           echo "compile step exit: ${{ steps.compile.outcome }}"
-          echo "bazel disk cache:  $((cas_kb / 1024 / 1024)) GiB"
-          echo "repository cache:  $((repos_kb / 1024 / 1024)) GiB"
+          echo "bazel disk cache:  $(mib "$cas_kb") MiB ($cas_kb KiB on disk, uncompressed)"
+          echo "repository cache:  $(mib "$repos_kb") MiB ($repos_kb KiB on disk, uncompressed)"
 
-          # Two-sided guard. A build that dies during analysis leaves a tiny
-          # cache, and saving that under a new key would replace a good golden
-          # with a useless one; an oversized cache would blow the quota.
+          # Two-sided guard, but the upper bound is only a pathology guard, not
+          # the quota. actions/cache zstd-compresses before uploading, so the
+          # quota applies to the STORED size, which is unknowable until after
+          # the save. Enforcing the quota against `du` compares the wrong units
+          # and silently threw away a perfectly good 5.4 GiB cache once already.
+          # The real quota check is the Verify step after the saves; this bound
+          # only rejects something implausible for a single build.
           if [ "$cas_kb" -ge "$MIN_CAS_KB" ] && [ "$cas_kb" -le "$MAX_CAS_KB" ]; then
             echo "save_cas=true" >> "$GITHUB_OUTPUT"
           else
             echo "save_cas=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::bazel disk cache is $((cas_kb / 1024 / 1024)) GiB, outside [$((MIN_CAS_KB / 1024 / 1024)), $((MAX_CAS_KB / 1024 / 1024))] GiB - not saving"
+            # ::error:: not ::warning::. A skipped disk-cache save silently
+            # disables every speedup this design exists for, while the build
+            # still succeeds and still looks healthy.
+            echo "::error::bazel disk cache is $(mib "$cas_kb") MiB, outside [$(mib "$MIN_CAS_KB"), $(mib "$MAX_CAS_KB")] MiB - NOT saving, so the next build will compile from scratch. Raise MAX_CAS_KB if this is a real build."
           fi
 
           if [ "$repos_kb" -gt 0 ] && [ "$repos_kb" -le "$MAX_REPOS_KB" ]; then
             echo "save_repos=true" >> "$GITHUB_OUTPUT"
           else
             echo "save_repos=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::repository cache is $((repos_kb / 1024 / 1024)) GiB, outside (0, $((MAX_REPOS_KB / 1024 / 1024))] GiB - not saving"
+            echo "::warning::repository cache is $(mib "$repos_kb") MiB, outside (0, $(mib "$MAX_REPOS_KB")] MiB - not saving"
           fi
 
       - name: Save golden bazel disk cache
@@ -421,6 +437,58 @@ jobs:
         with:
           path: ${{ env.REPO_CACHE_DIR }}
           key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+
+      # Report what the entries actually cost, and hold the repository to its
+      # quota in the only unit that matters. actions/cache compresses before
+      # uploading, so the quota is measured against STORED bytes and the only
+      # honest way to enforce it is to read the stored sizes back after saving.
+      # This is also the first run that produces the real compression ratio
+      # between the on-disk CAS and the uploaded entry, which is the number the
+      # thresholds should have been derived from.
+      - name: Verify stored cache size against the quota
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CAS_PREFIX: ios-golden-cas-v1-
+        run: |
+          set -uo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" > /tmp/caches.json
+
+          python3 - <<'PY' > /tmp/quota.txt
+          import json, os
+          quota = int(os.environ["QUOTA_BYTES"])
+          prefix = os.environ["CAS_PREFIX"]
+          caches = json.load(open("/tmp/caches.json")).get("actions_caches", [])
+          total = 0
+          worst = None
+          for c in sorted(caches, key=lambda c: -c["size_in_bytes"]):
+              size = c["size_in_bytes"]
+              total += size
+              print("  %6.2f GiB  %s" % (size / 2**30, c["key"]))
+              if c["key"].startswith(prefix) and (worst is None or size > worst[1]):
+                  worst = (c["id"], size)
+          print("TOTAL %d" % total)
+          if worst:
+              print("CASID %d" % worst[0])
+          print("OVER %d" % (1 if total > quota else 0))
+          PY
+
+          grep -E '^TOTAL |^CASID |^OVER ' /tmp/quota.txt || true
+          total=$(awk '/^TOTAL /{print $2}' /tmp/quota.txt)
+          over=$(awk '/^OVER /{print $2}' /tmp/quota.txt)
+          gib() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1073741824}'; }
+
+          echo "stored cache total: $(gib "${total:-0}") GiB of quota $QUOTA_GIB GiB"
+          if [ "${over:-0}" = "1" ]; then
+            id=$(awk '/^CASID /{print $2}' /tmp/quota.txt)
+            echo "::error::over quota; deleting this generation's disk cache entry $id so the repository keeps the previous generation instead"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" || true
+          elif [ "${{ steps.size.outputs.save_cas }}" != "true" ]; then
+            echo "::error::the disk cache was NOT saved this run, so every build will keep compiling from scratch until a seed succeeds"
+          else
+            echo "::notice::golden cache stored within quota; builders will hit it"
+          fi
 
       # Best effort. A cache entry is write-once, so the superseded generation
       # has to be deleted explicitly or it lingers until eviction and pushes the
