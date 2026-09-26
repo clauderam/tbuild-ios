@@ -100,9 +100,6 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-    # Read-only cache token: restores are allowed, the post-job save is not.
-    # The "Release restored cache" step is the second, independent guard.
-    cache-mode: read
     outputs:
       app_name: ${{ steps.metadata.outputs.app_name }}
       app_version: ${{ steps.metadata.outputs.app_version }}
@@ -133,15 +130,22 @@ jobs:
       # actions/cache find the entry, report cache-hit: 'true', and then skip the
       # download: the log says "Lookup only - skipping download". A build wired
       # that way silently compiles from scratch while every step reports success,
-      # which is exactly what happened once already. There is no lookup-only
-      # setting that downloads without arming the post-job save, so the two
-      # guarantees are provided separately:
+      # which is exactly what happened once already, and cost a 65-minute build
+      # that reported cache-hit: 'true' the whole way.
       #
-      #   * cache-mode: read on this job issues a read-only cache token, so the
-      #     post-job save cannot write even on a miss;
-      #   * the "Release restored cache" step below empties both paths before the
-      #     job ends, so a post-job save has nothing to save even if that token
-      #     were not honoured.
+      # actions/cache/restore arms a post-job save when it misses, and there is
+      # no setting that downloads without arming one. So a build must be stopped
+      # from writing some other way, and that is what the "Release restored
+      # cache" step below does: it empties both paths before the job's post-job
+      # steps run, so there is nothing to upload. An entry is write-once, so a
+      # branded or partial cache saved by a builder would permanently shadow the
+      # real golden for every future build.
+      #
+      # cache-mode: read was tried here as a second, platform-level guard and
+      # removed: the first build with it failed the publish job with
+      # "HTTP 403: Resource not accessible by integration" on the releases API,
+      # while the publish job's own permissions were unchanged. Do not reintroduce
+      # it without a full build plus publish to prove it is inert.
       #
       # The key is derived from files that are byte-identical on every branch, so
       # all builders share one entry and an upstream bump rotates it at once.
@@ -317,12 +321,11 @@ jobs:
           retention-days: 1
 
       # The IPA is built and the cache has served its purpose, so empty both
-      # cache paths before the job's post-job steps run. actions/cache/restore
-      # arms a post-job save on a miss, and a builder must never be able to
-      # write the golden: an entry is write-once, so a branded or partial cache
-      # saved here would permanently shadow the real golden for every future
-      # build. cache-mode: read is the primary guard; this makes the guarantee
-      # independent of it, and costs nothing because the runner is discarded.
+      # cache paths before the job's post-job steps run. This is the ONLY thing
+      # stopping a builder from writing the golden, and it is verified: after a
+      # build restored 1.5 GiB and released 7.0 GiB, the repository still held
+      # exactly the two seeded entries. The runner is discarded either way, so
+      # releasing the cache costs nothing.
       - name: Release restored cache
         if: always()
         continue-on-error: true
@@ -577,10 +580,10 @@ jobs:
     permissions:
       contents: read
     # This job only touches the cache to refresh its access clock, and restores
-    # into a throwaway probe path. Without a read-only token a miss on this
+    # This job only touches the cache to refresh its access clock, and restores
+    # into a throwaway path. The Release probe step below is what stops this
     # trusted trigger would save that empty directory under the golden key and
-    # block every future seed, so the guarantee is doubled up here too.
-    cache-mode: read
+    # which would block every future seed.
     steps:
       - name: Checkout for key computation
         uses: actions/checkout@v5
