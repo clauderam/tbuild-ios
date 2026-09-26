@@ -1,46 +1,145 @@
-name: CI
+name: iOS build
 
+# This file is the single source of truth for every build in the runner, and it
+# is mirrored byte-for-byte into the tbuild-actions service as its embedded
+# template (/opt/tbuild-actions/build-workflow.yml). The service rewrites
+# .github/workflows/build.yml on every app-branch job, so editing a build
+# branch by hand is pointless: change it here and in the template together.
+#
+# The service rebuilds every app branch from tbuild-ios-base, overriding only
+# .github/workflows/build.yml and build-system/branding/{branding.json,
+# logo.png,server_rsa.pub}. Everything else a build branch contains comes from
+# the base tree, which is the default branch pinned by TBUILD_SOURCE_SHA.
+#
+# Every job below builds the same tree in the same absolute location and pins
+# the same toolchain, so the bazel action keys are comparable across branches
+# and one cache seeded from the default branch can serve all of them.
 on:
   push:
-    branches: [ master ]
+    # App branches are bare slugs, so the trigger cannot be a positive pattern
+    # and the exclusion list has to name the two non-build branches: the
+    # default branch and the runner's immutable build base. The service's own
+    # workflow_test.go asserts exactly these two entries.
+    branches-ignore:
+      - "master"
+      - "tbuild-ios-base"
 
+  # Manual trigger. The default branch no longer builds on push, so this is how
+  # a build is started there. Leave seed_cache off for a normal build; turn it
+  # on to additionally rebuild the shared golden cache.
   workflow_dispatch:
+    inputs:
+      seed_cache:
+        description: "Also rebuild the shared golden cache from the unbranded tree"
+        type: boolean
+        default: false
 
+  # GitHub deletes cache entries that have not been accessed in 7 days. This
+  # restores the golden entries once a week to keep them alive during quiet
+  # periods. It builds nothing, but restoring does download the entries.
+  schedule:
+    - cron: "17 4 * * 1"
+
+# The source/build jobs are read-only. Only the isolated publish job receives
+# contents:write, and it never checks out or executes source-controlled code.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  SOURCE_DIR: /Users/Shared/telegram-ios
+  BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+  # Both cache directories live outside SOURCE_DIR so bazel never treats them
+  # as part of the source tree. Their absolute paths are part of the contract:
+  # the save and the restore must agree on them.
+  BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
+  REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
+  # Budget slices against the 10 GB per-repository cache quota. The two
+  # generated entries are sized independently so the loser of a size overrun
+  # costs a re-download, never the other entry.
+  MIN_CAS_KB: "262144"    # 256 MiB - below this the build never got going
+  MAX_CAS_KB: "5242880"   # 5 GiB
+  MAX_REPOS_KB: "3670016" # 3.5 GiB
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Branded build. Restores the golden caches and never writes them: it only
+  # ever uses actions/cache/restore with lookup-only, so no post-job save can
+  # fire, and it contains no save step at all. The only job that creates a cache
+  # entry is golden, below.
+  # ---------------------------------------------------------------------------
   build:
+    if: github.event_name != 'schedule'
     runs-on: macos-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      app_name: ${{ steps.metadata.outputs.app_name }}
+      app_version: ${{ steps.metadata.outputs.app_version }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      ipa_name: ${{ steps.metadata.outputs.ipa_name }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+    concurrency:
+      group: tbuild-build-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout app branch without persisted credentials
+        uses: actions/checkout@v5
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+          submodules: recursive
+          fetch-depth: "0"
+          persist-credentials: false
 
-      - name: Set active Xcode path
+      - name: Select pinned Xcode
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          set -euo pipefail
+          XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
-      - name: Create canonical source directory
+      # lookup-only keeps the post-job save from firing, so this step is the only
+      # thing that can ever touch the cache here. The key is derived from files
+      # that are byte-identical on every branch, so all builders share one entry
+      # and an upstream bump rotates it for everyone at once.
+      - name: Restore golden bazel disk cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-cas-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Restore golden external repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-repos-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Prepare canonical source directory
         run: |
-          set -x
+          set -euo pipefail
           sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
-      
-      - name: Apply branding and custom datacenter
+          rm -rf "$SOURCE_DIR"
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename "$GITHUB_WORKSPACE")" "$SOURCE_DIR"
+          # The checkout has no persisted write credential. Keep .git only for
+          # the build number/revision commands; never expose a token to source.
+
+      - name: Apply branding and datacenter
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          cd "$SOURCE_DIR"
           python3 build-system/apply_branding.py build-system/branding/branding.json
-      
-      - name: Regenerate provisioning profiles for bundle id
+
+      - name: Regenerate provisioning profiles
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          rm -rf build-system/fake-codesigning/profiles-backup
           cp -R build-system/fake-codesigning/profiles build-system/fake-codesigning/profiles-backup
           python3 build-system/Make/RegenerateProfilesForBundleId.py \
             --configurationPath=build-system/appstore-configuration.json \
@@ -48,144 +147,340 @@ jobs:
             --destinationProfiles=build-system/fake-codesigning/profiles \
             --certsPath=build-system/fake-codesigning/certs
 
-      - name: Normalize & Generate App Icons
+      - name: Generate app icons
         run: |
-          python3 -m pip install --upgrade --break-system-packages Pillow
-          cd /Users/Shared/telegram-ios
+          set -euo pipefail
+          python3 -m pip install --upgrade --break-system-packages Pillow==11.3.0
+          cd "$SOURCE_DIR"
           python3 build-system/generate_icons.py
 
-      - name: Build the App
+      - name: Build and verify IPA
+        id: metadata
         run: |
-          set -x
+          set -euo pipefail
+          cd "$SOURCE_DIR"
 
-          # source code paths are included in the final binary, so we need to make them stable across builds
-          SOURCE_DIR=/Users/Shared/telegram-ios
+          export APP_VERSION
+          APP_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+          APP_NAME=$(python3 -c 'import json; print(json.load(open("build-system/branding/branding.json"))["general"]["app_name"])')
+          printf 'APP_VERSION=%s\nBUILD_NUMBER=%s\n' "$APP_VERSION" "$BUILD_NUMBER" >> "$GITHUB_ENV"
 
-          # use canonical bazel root
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+          # Ship the IPA under the brand name from branding.json rather than the
+          # upstream Telegram.ipa. app_name is free-form, so reduce it to a safe
+          # filename and hand the result to the upload and publish steps instead
+          # of letting either re-derive it.
+          IPA_NAME=$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9._-' '_')
+          IPA_NAME="${IPA_NAME%.ipa}"
+          [ -n "$IPA_NAME" ] || IPA_NAME="App"
+          ARTIFACT_NAME="ios-ipa-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          printf 'app_name=%s\napp_version=%s\nbuild_number=%s\nipa_name=%s.ipa\nartifact_name=%s\n' \
+            "$APP_NAME" "$APP_VERSION" "$BUILD_NUMBER" "$IPA_NAME" "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
-          cd $SOURCE_DIR
-
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
-          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
+          # --cacheDir maps to bazel's --disk_cache. Make.py's --bazelArguments
+          # is parsed but never reaches the bazel command line, so the repository
+          # cache goes through the user rc file, which bazel reads after the
+          # workspace one and which nothing in the source tree sets.
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
             build \
-            --configurationPath="build-system/appstore-configuration.json" \
+            --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # collect ipa
-          OUTPUT_PATH="build/artifacts"
+          OUTPUT_PATH=build/artifacts
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
           IPA_FOUND=0
-          for f in bazel-bin/Telegram/Telegram.ipa \
-                   bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa \
-                   bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            if [ -f "$f" ]; then
-              echo "Found IPA at: $f"
-              cp "$f" "$OUTPUT_PATH/"
+          for candidate in \
+            bazel-bin/Telegram/Telegram.ipa \
+            bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa \
+            bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" "$OUTPUT_PATH/$IPA_NAME.ipa"
               IPA_FOUND=1
               break
             fi
           done
 
-          if [ $IPA_FOUND -eq 0 ]; then
-            echo "ERROR: IPA file not found!"
-            echo "Searching in bazel-bin:"
-            ls -la bazel-bin/Telegram/ || echo "No bazel-bin/Telegram/"
-            echo "Searching in bazel-out:"
-            find bazel-out -name "*.ipa" 2>/dev/null || echo "No ipa found"
+          if [ "$IPA_FOUND" -ne 1 ]; then
+            echo "ERROR: the build completed but no Telegram.ipa was found" >&2
+            find bazel-bin bazel-out -name '*.ipa' -type f -print 2>/dev/null || true
             exit 1
           fi
+          test "$(wc -c < "$OUTPUT_PATH/$IPA_NAME.ipa")" -gt 1048576
+          unzip -tq "$OUTPUT_PATH/$IPA_NAME.ipa"
+          ls -lh "$OUTPUT_PATH/$IPA_NAME.ipa"
 
-          # collect dsym
-          mkdir -p build/DSYMs
-          if [ -d "bazel-bin/Telegram" ]; then
-            for f in bazel-bin/Telegram/*.dSYM; do
-              if [ -d "$f" ]; then
-                echo "Copying dSYM: $f"
-                cp -R "$f" build/DSYMs/
-              fi
-            done
-          fi
-          
-          if [ -z "$(ls -A build/DSYMs 2>/dev/null)" ]; then
-            for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
-              if [ -d "$f" ]; then
-                echo "Copying dSYM from bazel-out: $f"
-                cp -R "$f" build/DSYMs/
-              fi
-            done
-          fi
-          
-          if [ -z "$(ls -A build/DSYMs 2>/dev/null)" ]; then
-            echo "WARNING: No dSYM files found!"
+          # upload-artifact resolves `path` against $GITHUB_WORKSPACE, not
+          # $SOURCE_DIR, so stage the verified IPA there. This is also what makes
+          # if-no-files-found: error a meaningful check.
+          mkdir -p "$GITHUB_WORKSPACE/build/artifacts"
+          cp "$OUTPUT_PATH/$IPA_NAME.ipa" "$GITHUB_WORKSPACE/build/artifacts/$IPA_NAME.ipa"
+
+      - name: Upload IPA to the workflow artifact store
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: build/artifacts/${{ steps.metadata.outputs.ipa_name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Golden cache seed. Runs only on the default branch, only on demand, and
+  # only when the dispatch asked for it, so an ordinary manual build does not
+  # pay for a second full compile alongside it.
+  #
+  # It builds the tree with no branding applied at all, so the cache holds the
+  # longest prefix shared by every future brand: ffmpeg, third-party, sqlcipher
+  # and the untouched submodules all become reusable, and only the handful of
+  # modules a brand actually edits get recompiled per build.
+  #
+  # It never uploads a release. A build failure here is tolerated on purpose -
+  # a signing or packaging failure still leaves a perfectly good compile cache
+  # behind, and refusing to save it would throw away 45 minutes of work.
+  # ---------------------------------------------------------------------------
+  golden:
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch && inputs.seed_cache
+    runs-on: macos-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      # Only this job creates or removes cache entries, so it is the only one
+      # that needs an actions token with write access.
+      actions: write
+    concurrency:
+      group: tbuild-golden-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: "0"
+          persist-credentials: false
+
+      - name: Select pinned Xcode
+        run: |
+          set -euo pipefail
+          XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+
+      # A rotation restores the previous generation so an upstream bump only
+      # recompiles telegram-ios itself. The save below uses a new key, because a
+      # cache entry is write-once and cannot be updated in place.
+      - name: Restore previous generation for a warm rebuild
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-cas-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Restore previous external repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-repos-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Prepare canonical source directory
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users/Shared
+          rm -rf "$SOURCE_DIR"
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename "$GITHUB_WORKSPACE")" "$SOURCE_DIR"
+
+      - name: Configure repository cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
+
+      - name: Compile unbranded tree
+        id: compile
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+
+          # Fixed build number: the number reaches variables.bzl and therefore
+          # the //Telegram packaging actions, and a stable value keeps them
+          # comparable between generations.
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber=1
+
+      - name: Measure generated caches
+        id: size
+        if: always()
+        run: |
+          set -euo pipefail
+          cas_kb=0
+          repos_kb=0
+          [ -d "$BAZEL_CACHE_DIR" ] && cas_kb=$(du -sk "$BAZEL_CACHE_DIR" | cut -f1)
+          [ -d "$REPO_CACHE_DIR" ] && repos_kb=$(du -sk "$REPO_CACHE_DIR" | cut -f1)
+
+          echo "compile step exit: ${{ steps.compile.outcome }}"
+          echo "bazel disk cache:  $((cas_kb / 1024 / 1024)) GiB"
+          echo "repository cache:  $((repos_kb / 1024 / 1024)) GiB"
+
+          # Two-sided guard. A build that dies during analysis leaves a tiny
+          # cache, and saving that under a new key would replace a good golden
+          # with a useless one; an oversized cache would blow the quota.
+          if [ "$cas_kb" -ge "$MIN_CAS_KB" ] && [ "$cas_kb" -le "$MAX_CAS_KB" ]; then
+            echo "save_cas=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Found dSYM files:"
-            ls -la build/DSYMs/
+            echo "save_cas=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::bazel disk cache is $((cas_kb / 1024 / 1024)) GiB, outside [$((MIN_CAS_KB / 1024 / 1024)), $((MAX_CAS_KB / 1024 / 1024))] GiB - not saving"
           fi
-          
-          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
-          echo "Build artifacts collected successfully!"
-          echo "Contents of $OUTPUT_PATH:"
-          ls -la "$OUTPUT_PATH/"
 
-      - name: Prepare unique release tag
-        run: |
-          set -x
-          REF="$(echo "${{ github.ref_name }}" | tr '/' '-')"
-          # Uniqueness per run: run_id + run_attempt guarantee a fresh tag every
-          # run, so a release is always created and previously published releases
-          # are never overwritten or deleted.
-          RELEASE_TAG="build-${REF}-${{ env.BUILD_NUMBER }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_ENV
-          echo "release tag: ${RELEASE_TAG}"
+          if [ "$repos_kb" -gt 0 ] && [ "$repos_kb" -le "$MAX_REPOS_KB" ]; then
+            echo "save_repos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "save_repos=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::repository cache is $((repos_kb / 1024 / 1024)) GiB, outside (0, $((MAX_REPOS_KB / 1024 / 1024))] GiB - not saving"
+          fi
 
-      - name: Create GitHub Release
+      - name: Save golden bazel disk cache
+        if: steps.size.outputs.save_cas == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+
+      - name: Save golden external repository cache
+        if: steps.size.outputs.save_repos == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+
+      # Best effort. A cache entry is write-once, so the superseded generation
+      # has to be deleted explicitly or it lingers until eviction and pushes the
+      # repository over quota alongside its replacement. Failure here only costs
+      # quota, so it must not fail the job. This is the one job that gets
+      # actions:write, and it is the one job allowed to manage cache entries.
+      - name: Retire superseded golden entries
+        if: always()
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_CAS: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          CURRENT_REPOS: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
         run: |
-          set -x
-          cd /Users/Shared/telegram-ios
+          set -uo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" > /tmp/caches.json
+          python3 -c '
+          import json, os
+          keep = {os.environ["CURRENT_CAS"], os.environ["CURRENT_REPOS"]}
+          caches = json.load(open("/tmp/caches.json")).get("actions_caches", [])
+          for c in caches:
+              if c["key"].startswith("ios-golden-") and c["key"] not in keep:
+                  print(c["id"])
+          ' > /tmp/stale_ids
+          while read -r id; do
+            [ -n "$id" ] || continue
+            echo "deleting superseded cache $id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" || true
+          done < /tmp/stale_ids
 
-          RELEASE_TAG="${{ env.RELEASE_TAG }}"
-          REL_TITLE="Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})"
-          REL_NOTES="An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})"
+  # ---------------------------------------------------------------------------
+  # Weekly keepalive. Restores the golden entries so their last-access clock is
+  # refreshed and the 7-day eviction window does not swallow them. This builds
+  # nothing, but a restore is a real download, so it costs a few minutes of
+  # runner time rather than a minute.
+  # ---------------------------------------------------------------------------
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: tbuild-keepalive-${{ github.repository }}
+      cancel-in-progress: false
 
-          # Attach only the artifacts that actually exist. dSYMs stay out of the
-          # release upload.
-          ASSETS=()
-          for asset in "build/artifacts/Telegram.ipa"; do
-            if [ -f "$asset" ]; then
-              ASSETS+=("$asset")
-            else
-              echo "WARNING: missing artifact, skipping: $asset"
-            fi
-          done
+    steps:
+      - name: Checkout for key computation
+        uses: actions/checkout@v5
 
-          # Retry transient API failures; fail loudly only after 3 attempts.
-          n=0
-          until gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+      - name: Touch golden bazel disk cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-cas-v1-${{ runner.os }}-
+          lookup-only: true
+
+      - name: Touch golden external repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          restore-keys: |
+            ios-golden-repos-v1-${{ runner.os }}-
+          lookup-only: true
+
+  publish:
+    needs: build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: tbuild-publish-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Download the verified IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: publish
+
+      - name: Publish IPA release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_NAME: ${{ needs.build.outputs.app_name }}
+          APP_VERSION: ${{ needs.build.outputs.app_version }}
+          BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
+          IPA_NAME: ${{ needs.build.outputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          test -s "publish/$IPA_NAME"
+          REF=${GITHUB_REF_NAME//\//-}
+          RELEASE_TAG="build-${REF}-${BUILD_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          attempt=1
+          until gh release create "$RELEASE_TAG" "publish/$IPA_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "$REL_TITLE" \
-            --notes "$REL_NOTES"; do
-            n=$((n+1))
-            if [ "$n" -ge 3 ]; then
-              echo "ERROR: failed to create release after $n attempts" >&2
+            --title "$APP_NAME $APP_VERSION ($BUILD_NUMBER)" \
+            --notes "iOS build $APP_VERSION ($BUILD_NUMBER) for $GITHUB_REF_NAME"; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "ERROR: release creation failed after $attempt attempts" >&2
               exit 1
             fi
-            echo "release create attempt #$n failed, retrying in 10s"
+            attempt=$((attempt + 1))
             sleep 10
           done
