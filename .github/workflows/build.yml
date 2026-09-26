@@ -86,6 +86,9 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
+    # Read-only cache token: restores are allowed, the post-job save is not.
+    # The "Release restored cache" step is the second, independent guard.
+    cache-mode: read
     outputs:
       app_name: ${{ steps.metadata.outputs.app_name }}
       app_version: ${{ steps.metadata.outputs.app_version }}
@@ -107,16 +110,27 @@ jobs:
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
       # Cache handling is strictly best-effort and must never be able to fail a
-      # build. A missing entry, a truncated download, a stale generation or a
-      # half-written directory all end the same way: the directory is discarded
-      # and bazel compiles the whole tree exactly as it did before any of this
-      # existed. continue-on-error covers a failing restore step, and the scrub
-      # below covers a restore that "succeeds" with unusable content.
+      # build. A missing entry, a truncated download, an entry evicted by the
+      # 7-day policy, a generation left by an older layout and a half-written
+      # directory all end the same way: the build compiles the whole tree exactly
+      # as it did before any of this existed.
       #
-      # lookup-only keeps the post-job save from firing, so these steps are the
-      # only thing that can ever touch the cache here. The key is derived from
-      # files that are byte-identical on every branch, so all builders share one
-      # entry and an upstream bump rotates it for everyone at once.
+      # This step MUST NOT set lookup-only. Despite the name, lookup-only makes
+      # actions/cache find the entry, report cache-hit: 'true', and then skip the
+      # download: the log says "Lookup only - skipping download". A build wired
+      # that way silently compiles from scratch while every step reports success,
+      # which is exactly what happened once already. There is no lookup-only
+      # setting that downloads without arming the post-job save, so the two
+      # guarantees are provided separately:
+      #
+      #   * cache-mode: read on this job issues a read-only cache token, so the
+      #     post-job save cannot write even on a miss;
+      #   * the "Release restored cache" step below empties both paths before the
+      #     job ends, so a post-job save has nothing to save even if that token
+      #     were not honoured.
+      #
+      # The key is derived from files that are byte-identical on every branch, so
+      # all builders share one entry and an upstream bump rotates it at once.
       - name: Restore golden bazel disk cache
         id: restore_cas
         continue-on-error: true
@@ -126,7 +140,6 @@ jobs:
           key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-cas-v1-${{ runner.os }}-
-          lookup-only: true
 
       - name: Restore golden external repository cache
         id: restore_repos
@@ -137,37 +150,42 @@ jobs:
           key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-repos-v1-${{ runner.os }}-
-          lookup-only: true
 
-      # Discard anything that is not a usable cache of the expected shape.
-      # bazel lays its disk cache out as ac/ and cas/, and its repository cache
-      # as content_addressable/. Anything else - a partial extraction, an empty
-      # directory left by a failed restore, a stale generation from a different
-      # layout - is removed here so the build simply compiles from scratch.
-      - name: Discard unusable cache content
+      # Report what the restore actually produced. This deliberately does not
+      # delete anything: a wrong guess about the cache layout must cost a slow
+      # build, never a silently discarded download. The two failure shapes worth
+      # shouting about are a hit that produced no usable directory, and content
+      # in an unexpected shape - both are bugs here, not conditions to absorb.
+      - name: Report restored cache content
+        id: scrub
         continue-on-error: true
         run: |
           set -euo pipefail
-          echo "disk cache hit:  '${{ steps.restore_cas.outputs.cache-hit }}'"
-          echo "repos cache hit: '${{ steps.restore_repos.outputs.cache-hit }}'"
+          cas_hit="${{ steps.restore_cas.outputs.cache-hit }}"
+          repos_hit="${{ steps.restore_repos.outputs.cache-hit }}"
+          echo "disk cache hit:  '$cas_hit'"
+          echo "repos cache hit: '$repos_hit'"
 
-          scrub() {
-            dir="$1"; marker_a="$2"; marker_b="$3"; label="$4"
-            if [ ! -e "$dir" ]; then
-              echo "$label: absent, compiling from scratch"
+          # $1 dir, $2 expected subdir, $3 label, $4 whether a hit was reported
+          inspect() {
+            dir="$1"; marker="$2"; label="$3"; hit="$4"
+            if [ ! -d "$dir" ]; then
+              if [ "$hit" = "true" ]; then
+                echo "::error::$label reported a cache hit but $dir does not exist - the entry was matched and never downloaded, so this build is compiling from scratch"
+              else
+                echo "$label: absent, no entry to restore; compiling from scratch"
+              fi
               return 0
             fi
             size_kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
-            if [ -d "$dir/$marker_a" ] || [ -d "$dir/$marker_b" ]; then
-              echo "$label: usable, $((size_kb / 1024)) MiB"
-              return 0
+            echo "$label: $((size_kb / 1024)) MiB, top level: $(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
+            if [ ! -d "$dir/$marker" ]; then
+              echo "::error::$label at $dir has no $marker/ directory. Leaving it in place rather than deleting a possibly-valid download; if bazel misses, the layout assumption in this step is wrong and needs fixing."
             fi
-            echo "::warning::$label at $dir is not a usable cache ($((size_kb / 1024)) MiB, no $marker_a/ or $marker_b/); discarding it"
-            rm -rf "${dir:?}"
           }
 
-          scrub "$BAZEL_CACHE_DIR" cas ac "bazel disk cache"
-          scrub "$REPO_CACHE_DIR" content_addressable repo_toolchains "external repository cache"
+          inspect "$BAZEL_CACHE_DIR" cas "bazel disk cache" "$cas_hit"
+          inspect "$REPO_CACHE_DIR" content_addressable "external repository cache" "$repos_hit"
 
       - name: Prepare canonical source directory
         run: |
@@ -284,6 +302,26 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The IPA is built and the cache has served its purpose, so empty both
+      # cache paths before the job's post-job steps run. actions/cache/restore
+      # arms a post-job save on a miss, and a builder must never be able to
+      # write the golden: an entry is write-once, so a branded or partial cache
+      # saved here would permanently shadow the real golden for every future
+      # build. cache-mode: read is the primary guard; this makes the guarantee
+      # independent of it, and costs nothing because the runner is discarded.
+      - name: Release restored cache
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for dir in "$BAZEL_CACHE_DIR" "$REPO_CACHE_DIR"; do
+            if [ -d "$dir" ]; then
+              du -sh "$dir" 2>/dev/null | sed 's/^/  releasing /'
+              rm -rf "${dir:?}"
+            fi
+          done
+          echo "cache paths emptied; nothing left for a post-job save to upload"
+
   # ---------------------------------------------------------------------------
   # Golden cache seed. Runs only on the default branch, only on demand, and
   # only when the dispatch asked for it, so an ordinary manual build does not
@@ -321,29 +359,16 @@ jobs:
           XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
-      # A rotation restores the previous generation so an upstream bump only
-      # recompiles telegram-ios itself. The save below uses a new key, because a
-      # cache entry is write-once and cannot be updated in place.
-      - name: Restore previous generation for a warm rebuild
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.BAZEL_CACHE_DIR }}
-          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
-          restore-keys: |
-            ios-golden-cas-v1-${{ runner.os }}-
-          lookup-only: true
-
-      - name: Restore previous external repository cache
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.REPO_CACHE_DIR }}
-          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
-          restore-keys: |
-            ios-golden-repos-v1-${{ runner.os }}-
-          lookup-only: true
-
+      # A seed is deliberately always a cold build. Restoring the previous
+      # generation here would need a download, and there is no lookup-only
+      # setting that downloads without arming a post-job save - and a post-job
+      # save would bypass the MIN_CAS_KB guard below, so a seed that died during
+      # analysis could install a near-empty entry under the new key and shadow
+      # the good generation for every future build. A rotation therefore costs
+      # one full compile, which is the price of never shipping a bad golden.
+      #
+      # The explicit save steps further down are the only thing in this workflow
+      # that writes a cache entry.
       - name: Prepare canonical source directory
         run: |
           set -euo pipefail
@@ -531,11 +556,17 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    # This job only touches the cache to refresh its access clock, and restores
+    # into a throwaway probe path. Without a read-only token a miss on this
+    # trusted trigger would save that empty directory under the golden key and
+    # block every future seed, so the guarantee is doubled up here too.
+    cache-mode: read
     steps:
       - name: Checkout for key computation
         uses: actions/checkout@v5
 
       - name: Touch golden bazel disk cache
+        id: touch_cas
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -543,9 +574,9 @@ jobs:
           key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-cas-v1-${{ runner.os }}-
-          lookup-only: true
 
       - name: Touch golden external repository cache
+        id: touch_repos
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -553,7 +584,19 @@ jobs:
           key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
           restore-keys: |
             ios-golden-repos-v1-${{ runner.os }}-
-          lookup-only: true
+
+      # Same reasoning as the build job's release step: leave nothing for a
+      # post-job save to upload under the golden key. An access is recorded by
+      # the restore above, which is the only thing this job is here to do.
+      - name: Release probe
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "  cas   hit='${{ steps.touch_cas.outputs.cache-hit }}'"
+          echo "  repos hit='${{ steps.touch_repos.outputs.cache-hit }}'"
+          rm -rf "${BAZEL_CACHE_DIR:?}" "${REPO_CACHE_DIR:?}"
+          echo "probe paths emptied; golden access clock refreshed"
 
   publish:
     needs: build
