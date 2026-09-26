@@ -25,18 +25,21 @@ on:
       - "tbuild-ios-base"
 
   # Manual trigger. The default branch no longer builds on push, so this is how
-  # a build is started there. The three dispatch modes on the default branch:
-  #
-  #   probe_only   restore both golden entries, report whether they arrived,
-  #                empty the paths, exit. About two minutes, no compilation.
-  #                This is the cheap end-to-end check of the cache wiring.
-  #   seed_cache   compile the unbranded tree and save a new golden generation.
-  #                A full compile, and deliberately cold.
-  #   neither      an ordinary branded build of this branch, with a release.
-  #
-  # seed_cache wins if both are set, since a seed is a build too.
+  # anything is started there. The dispatch inputs below are the only dispatch
+  # inputs in this workflow; a build branch gets a push and nothing else, which
+  # is why the template copy of this file has no workflow_dispatch at all.
   workflow_dispatch:
     inputs:
+      # Three modes, on the default branch:
+      #
+      #   probe_only   restore both golden entries, report whether they arrived,
+      #                empty the paths, exit. About two minutes, no compilation.
+      #                This is the cheap end-to-end check of the cache wiring.
+      #   seed_cache   compile the unbranded tree and save a new golden
+      #                generation. A full compile, and deliberately cold.
+      #   neither      an ordinary branded build of this branch, with a release.
+      #
+      # seed_cache wins if both are set, since a seed is a build too.
       seed_cache:
         description: "Rebuild the shared golden cache from the unbranded tree (a full cold compile)"
         type: boolean
