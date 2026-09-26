@@ -551,7 +551,10 @@ jobs:
   # runner time rather than a minute.
   # ---------------------------------------------------------------------------
   keepalive:
-    if: github.event_name == 'schedule'
+    # Also dispatchable, which makes it the cheap end-to-end probe for cache
+    # wiring: it restores both entries, prints whether they arrived, empties the
+    # paths and exits, without compiling anything.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
