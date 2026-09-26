@@ -314,6 +314,18 @@ class Branding:
         short = g['url_scheme_short']
         long = g['url_scheme']
 
+        # A brand may point url_scheme and url_scheme_short at the same string.
+        # dict.fromkeys() keeps the first occurrence and drops later repeats, so
+        # each distinct scheme contributes exactly one comparison arm and one
+        # customSchemes entry. Without this the generated Swift contains a
+        # tautology (x == "ram" || x == "ram") and walks every candidate URL
+        # twice.
+        schemes = list(dict.fromkeys([short, long]))
+        scheme_comparison = ' || '.join('parsedUrl.scheme == "{}"'.format(s) for s in schemes)
+        if len(schemes) > 1:
+            scheme_comparison = '(' + scheme_comparison + ')'
+        custom_scheme_list = ', '.join('"{}://"'.format(s) for s in schemes)
+
         def transform(text):
             pairs = [
                 ('private let baseTelegramMePaths = [\n    "telegram.me",\n    "t.me", "telegram.dog"\n]',
@@ -322,7 +334,7 @@ class Branding:
                  'private let telegramWebShortLinkHosts = [\n    "a.' + host + '",\n    "k.' + host + '",\n    "z.' + host + '"\n]'),
                 ('"t.me/iv?",', '"' + host + '/iv?",'),
                 ('url: "https://t.me/\\(query)"', 'url: "https://' + host + '/\\(query)"'),
-                ('parsedUrl.scheme == "tg"', '(parsedUrl.scheme == "' + short + '" || parsedUrl.scheme == "' + long + '")'),
+                ('parsedUrl.scheme == "tg"', scheme_comparison),
             ]
             for old, new in pairs:
                 if old not in text:
@@ -343,7 +355,7 @@ class Branding:
                 '                return .single(.result(.externalUrl(url)))\n'
                 '            }\n'
                 '\n'
-                '            let customSchemes = ["' + short + '://", "' + long + '://"]\n'
+                '            let customSchemes = [' + custom_scheme_list + ']\n'
                 '            for customScheme in customSchemes {\n'
                 '                if url.lowercased().hasPrefix(customScheme) {\n'
                 '                    var query = String(url[url.index(url.startIndex, offsetBy: customScheme.count)...])\n'
@@ -393,9 +405,21 @@ class Branding:
 
     def apply_url_scheme_plists(self, rels):
         # Info.plist / InfoBazel.plist: only the legacy short scheme is rebranded.
-        short = self.cfg['general']['url_scheme_short']
+        g = self.cfg['general']
+        short = g['url_scheme_short']
         for rel in rels:
             self.require_replace(rel, '<string>tg</string>', '<string>' + short + '</string>', rel + ' legacy URL scheme')
+
+        # The .compatibility URL type carries the legacy scheme and
+        # $(APP_SPECIFIC_URL_SCHEME) side by side. A brand is free to point
+        # url_scheme_short and app_specific_url_scheme at the same string, and
+        # shipping the array with that string twice registers a duplicate URL
+        # scheme, which App Store review rejects. Drop the second entry so the
+        # array holds each distinct scheme exactly once.
+        if g.get('app_specific_url_scheme') == short:
+            for rel in rels:
+                self.require_replace(rel, '\t\t\t\t<string>$(APP_SPECIFIC_URL_SCHEME)</string>\n', '',
+                                     rel + ' duplicate app-specific URL scheme')
 
     def apply_strings_files(self, rels):
         for rel in rels:
