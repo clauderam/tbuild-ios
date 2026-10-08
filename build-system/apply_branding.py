@@ -18,6 +18,60 @@ import sys
 
 WIDTH = 64
 
+# Source suffixes the outbound-link sweep walks.
+SHARE_LINK_SUFFIXES = ('.swift', '.m', '.mm')
+
+# A t.me *link literal*, as opposed to the substring 't.me', which occurs 2133
+# times across the tree as ordinary Swift - 'contex' + 't.me' + 'diaManager'.
+# Without the word boundary a plain replace rewrites identifiers; without the
+# delimiter guard it would also rewrite the scheme-relative forms twice.
+share_link_pattern = re.compile(r'://t\.me\b|(?<![:/])\bt\.me/')
+
+# Applied in order, so the scheme-delimited form is consumed before the bare one.
+SHARE_LINK_REWRITES = (
+    (re.compile(r'://t\.me\b'), '://{host}'),
+    (re.compile(r'(?<![:/])\bt\.me/'), '{host}/'),
+)
+
+# Places that must accept the brand host *and* upstream t.me. These are QR
+# scanners, and the brand host has to be ADDED rather than substituted: the
+# brand's own users scan each other's codes, and those codes are emitted by
+# this same app (QrCodeScreen.swift), so a scanner pinned to t.me alone would
+# silently reject every peer QR the ecosystem produces. t.me stays accepted so
+# a code from outside still opens.
+#
+# These are whole-line rewrites rather than substitutions, which means the sweep
+# must skip their files - a substitution would collapse each line back to a
+# single host. verify_share_links() then asserts the exact rewritten line is
+# present and that no other link literal is hiding in the same file.
+def share_link_dual_host(host):
+    return (
+        (
+            'submodules/QrCodeUI/Sources/QrCodeScanScreen.swift',
+            'codes.filter { $0.message.hasPrefix("https://t.me/") || $0.message.hasPrefix("t.me/") }',
+            'codes.filter { $0.message.hasPrefix("https://' + host + '/") || $0.message.hasPrefix("' + host + '/") '
+            '|| $0.message.hasPrefix("https://t.me/") || $0.message.hasPrefix("t.me/") }',
+        ),
+        (
+            'submodules/TelegramUI/Components/CameraScreen/Sources/CameraScreen.swift',
+            'if message.hasPrefix("t.me/c/") || message.hasPrefix("t.me/+") '
+            '|| message.hasPrefix("t.me/contact/") || message.hasPrefix("t.me/") {',
+            'if message.hasPrefix("' + host + '/c/") || message.hasPrefix("' + host + '/+") '
+            '|| message.hasPrefix("' + host + '/contact/") || message.hasPrefix("' + host + '/") '
+            '|| message.hasPrefix("t.me/c/") || message.hasPrefix("t.me/+") '
+            '|| message.hasPrefix("t.me/contact/") || message.hasPrefix("t.me/") {',
+        ),
+    )
+
+
+def rewrite_share_links(text, host):
+    """Return (new_text, replacements). Count is 0 when nothing matched."""
+    count = 0
+    for pattern, template in SHARE_LINK_REWRITES:
+        text, hits = pattern.subn(template.format(host=host), text)
+        count += hits
+    return text, count
+
 
 def read(path):
     with open(path, 'r', encoding='utf-8', newline='') as f:
@@ -328,10 +382,17 @@ class Branding:
 
         def transform(text):
             pairs = [
+                # Brand host first so it wins every prefix comparison, with the
+                # upstream hosts retained as fallbacks. The brand runs its own
+                # ecosystem, but it still talks to Telegram's servers, so a
+                # t.me link that arrives from outside has to resolve internally
+                # instead of falling through to .externalUrl and Safari. Without
+                # the fallback the QR scanners below would accept a t.me code
+                # that nothing in the app could then open.
                 ('private let baseTelegramMePaths = [\n    "telegram.me",\n    "t.me", "telegram.dog"\n]',
-                 'private let baseTelegramMePaths = [\n    "' + host + '"\n]'),
+                 'private let baseTelegramMePaths = [\n    "' + host + '",\n    "telegram.me",\n    "t.me", "telegram.dog"\n]'),
                 ('private let telegramWebShortLinkHosts = [\n    "a.t.me", \n    "k.t.me",\n    "z.t.me"\n]',
-                 'private let telegramWebShortLinkHosts = [\n    "a.' + host + '",\n    "k.' + host + '",\n    "z.' + host + '"\n]'),
+                 'private let telegramWebShortLinkHosts = [\n    "a.' + host + '", "k.' + host + '", "z.' + host + '",\n    "a.t.me", "k.t.me", "z.t.me"\n]'),
                 ('"t.me/iv?",', '"' + host + '/iv?",'),
                 ('url: "https://t.me/\\(query)"', 'url: "https://' + host + '/\\(query)"'),
                 ('parsedUrl.scheme == "tg"', scheme_comparison),
@@ -402,6 +463,116 @@ class Branding:
             )
             return text.replace(old_anchor, custom)
         self.require(rel, transform, 'UrlHandling.swift custom schemes')
+
+    # ------- outbound share links -------
+
+    def apply_share_links(self):
+        """Point every link the app hands the user at the brand host.
+
+        Upstream spells its outbound links out as t.me literals in ~100 places:
+        the link row on a profile, the QR payload, the share sheet, copy-link,
+        message permalinks, the admin log, the chat-folder slug parser, the
+        @id contact reference, and the prefix labels on the create-channel /
+        create-group / public-link / theme-slug forms. Desktop and Android read
+        the host from configuration; iOS hardcodes it, so an unbranded fork
+        ships t.me links into its own ecosystem.
+
+        Invite links minted by the server are deliberately NOT rewritten.
+        ExportedInvitation.link (TelegramCore/Sources/ApiUtils/
+        ExportedInvitation.swift) is the value messages.exportChatInvite
+        returned verbatim, and Telegram's own infrastructure mints it as t.me,
+        so there is nothing on the client to rewrite.
+        """
+        host = self.cfg['general']['host']
+        dual = {rel: (old, new) for rel, old, new in share_link_dual_host(host)}
+
+        swept_files = 0
+        swept_links = 0
+        for rel, (old, new) in dual.items():
+            text = read(self.path(rel))
+            if new in text:
+                continue
+            if old not in text:
+                self.report(False, 'dual-host scanner line in ' + rel)
+                continue
+            write(self.path(rel), text.replace(old, new, 1))
+            self.report(True, 'dual-host scanner line in ' + rel)
+
+        for rel in self.link_sources():
+            if rel in dual:
+                continue
+            text = read(self.path(rel))
+            new_text, count = rewrite_share_links(text, host)
+            if count:
+                write(self.path(rel), new_text)
+                swept_files += 1
+                swept_links += count
+
+        print('[apply_branding] ok: share links in %d file(s), %d link literal(s) -> %s'
+              % (swept_files, swept_links, host))
+
+    def verify_share_links(self):
+        """Fail the build unless the sweep left exactly the intended residue.
+
+        Two things can silently go wrong: the sweep can stop covering a site
+        (upstream adds a new literal), or a hand-written dual-host line can
+        move upstream and stop being recognised. Either way the residue stops
+        matching what this script expects, and a build that ships a half-branded
+        link - or a scanner that cannot open the ecosystem's own QR codes - is
+        worse than a red one.
+        """
+        dual = share_link_dual_host(self.cfg['general']['host'])
+
+        # The scanners are the only files allowed to keep a t.me literal, and
+        # only the ones their rewritten line contains.
+        allowed = {}
+        for rel, _old, new in dual:
+            allowed[rel] = len(share_link_pattern.findall(new))
+
+        leaked = []
+        for rel in self.link_sources():
+            count = len(share_link_pattern.findall(read(self.path(rel))))
+            want = allowed.get(rel, 0)
+            if count != want:
+                leaked.append('share-link residue in %s (expected %d, found %d)'
+                              % (rel, want, count))
+        for what in leaked:
+            self.report(False, what)
+        if not leaked:
+            self.report(True, 'share-link residue (%d literal(s) left, all on dual-host scanner lines)'
+                        % sum(allowed.values()))
+
+        # Each rewritten scanner line must be present verbatim.
+        for rel, _old, new in dual:
+            if new not in read(self.path(rel)):
+                self.report(False, 'dual-host scanner line missing in ' + rel)
+
+        # The upstream hosts have to survive as fallbacks, or an inbound t.me
+        # link resolves to .externalUrl and opens in Safari instead of the app.
+        handling = read(self.path('submodules/UrlHandling/Sources/UrlHandling.swift'))
+        if '"t.me"' not in handling:
+            self.report(False, 't.me fallback missing from UrlHandling baseTelegramMePaths')
+        else:
+            self.report(True, 'UrlHandling t.me fallback retained')
+
+    def link_sources(self):
+        """Every app source file that may hold an outbound link literal.
+
+        Sorted so a build is reproducible and a diff is readable. Generated
+        trees are skipped: they are regenerated from upstream, so a rewrite
+        there is lost on the next sync.
+        """
+        found = []
+        for root in ('submodules', 'Telegram'):
+            base = self.path(root)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = sorted(d for d in dirnames if d != 'Generated')
+                for name in sorted(filenames):
+                    if name.endswith(SHARE_LINK_SUFFIXES):
+                        found.append(os.path.relpath(os.path.join(dirpath, name), self.root))
+        return found
 
     def apply_url_scheme_plists(self, rels):
         # Info.plist / InfoBazel.plist: only the legacy short scheme is rebranded.
@@ -496,6 +667,11 @@ def main(argv):
     b.apply_appstore_config('build-system/appstore-configuration.json')
     b.apply_build('Telegram/BUILD')
     b.apply_url_handling('submodules/UrlHandling/Sources/UrlHandling.swift')
+    # After apply_url_handling, which already rebases UrlHandling.swift's own
+    # two 'url: "https://t.me/\(query)"' sites and 't.me/iv?' - the sweep would
+    # otherwise race it for the same text.
+    b.apply_share_links()
+    b.verify_share_links()
     b.apply_url_scheme_plists([
         'Telegram/Telegram-iOS/Info.plist',
         'Telegram/Telegram-iOS/InfoBazel.plist',
