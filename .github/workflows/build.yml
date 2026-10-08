@@ -76,22 +76,6 @@ env:
   # the save and the restore must agree on them.
   BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
   REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
-  # How much of the tree a build actually had to compile. The golden seed
-  # reports the total action count; a branded build reports how many it
-  # executed, which is every action the unbranded cache could not serve - the
-  # branded modules plus whatever their changed outputs invalidated. Comparing
-  # the two is the only honest measure of what branding costs a build, and
-  # nothing else in this workflow reports it.
-  #
-  # Outside SOURCE_DIR so bazel never treats the log as a source file, and not
-  # under either cache directory so "Release restored cache" does not have to
-  # know about it.
-  EXECUTION_LOG: /private/var/tmp/tbuild-cache/execution-log.json
-  # Single kill switch for the measurement. The flag is written into the *user*
-  # rc file, which bazel reads after the workspace one, so it cannot collide
-  # with the tree - but an unrecognised flag fails the build, and cache
-  # handling must never be able to do that. Set this to 0 to stop writing it.
-  MEASURE_BAZEL_ACTIONS: "1"
   # Guard rails for the seed, not the quota. These upper bounds only reject
   # something implausible for a single build. The quota is enforced after the
   # save, against stored bytes, by the Verify step in the golden job - the one
@@ -287,19 +271,14 @@ jobs:
           # --cacheDir maps to bazel's --disk_cache. Make.py's --bazelArguments
           # is parsed but never reaches the bazel command line, so the repository
           # cache goes through the user rc file, which bazel reads after the
-          # workspace one and which nothing in the source tree sets. The
-          # execution log rides along in the same file, so it too needs no
-          # change to Make.py. It is an observer, not an input, so it changes
-          # no action key and cannot disturb the cache.
-          mkdir -p "$REPO_CACHE_DIR" "$(dirname "$EXECUTION_LOG")"
-          {
-            printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR"
-            if [ "${MEASURE_BAZEL_ACTIONS:-1}" = "1" ]; then
-              printf 'build --execution_log_json_file=%s\n' "$EXECUTION_LOG"
-            fi
-          } > "$HOME/.bazelrc"
+          # workspace one and which nothing in the source tree sets.
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          # tee so the step below has bazel's own closing summary line to read.
+          # pipefail is set above, so a failing build still fails this step, and
+          # tee passes the console output through unchanged.
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --cacheDir="$BAZEL_CACHE_DIR" \
@@ -307,7 +286,7 @@ jobs:
             --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER"
+            --buildNumber="$BUILD_NUMBER" 2>&1 | tee "$RUNNER_TEMP/bazel-build.log"
 
           OUTPUT_PATH=build/artifacts
           rm -rf "$OUTPUT_PATH"
@@ -347,32 +326,58 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # Best effort, and never fatal. Counts the actions bazel actually ran,
-      # which is the exact set the unbranded cache could not serve. Compare it
-      # against the seed's total to get the reuse ratio; there is no other way
-      # to tell whether branding is costing a minute or an hour, and no other
-      # signal in this workflow would show it.
-      - name: Report compiled action count
+      # Best effort, and never fatal. Bazel already prints the whole breakdown on
+      # one line at the end of every build, so this reads that line rather than
+      # asking bazel to produce anything extra:
+      #
+      #   INFO: 6002 processes: 4798 disk cache hit, 1083 internal, 118 local, 3 worker.
+      #
+      # `worker` is the number that answers "what did branding cost". The
+      # workspace rc sets --strategy=SwiftCompile=worker, so worker actions are
+      # Swift compiles and everything else is genrules, packaging or spawns.
+      # `internal` and `local` are actions the disk cache never served; they
+      # are a constant baseline and do not move when branding changes - two
+      # runs a week apart reported them identically - so a change in `worker`
+      # is the only thing here that means branding got more expensive.
+      #
+      # An earlier version of this asked bazel for --execution_log_json_file
+      # instead. That is a heap cost inside the bazel server: it OOMed a build
+      # that had already reported success, turning a good IPA into a failed job,
+      # and it produced no log anyway because the server died before flushing.
+      # Reading bazel's own output cannot fail a build.
+      - name: Report compile breakdown
         if: always()
         continue-on-error: true
         run: |
           set -uo pipefail
-          if [ ! -s "$EXECUTION_LOG" ]; then
-            echo "no execution log at $EXECUTION_LOG (measurement off, or bazel never wrote one)"
+          LOG="$RUNNER_TEMP/bazel-build.log"
+          if [ ! -s "$LOG" ]; then
+            echo "no bazel log at $LOG (the build step did not run, or failed before bazel spoke)"
             exit 0
           fi
-          actions=$(grep -c '' "$EXECUTION_LOG" || true)
-          size=$(du -h "$EXECUTION_LOG" 2>/dev/null | cut -f1)
-          echo "bazel executed $actions action(s); execution log $size"
+          line=$(grep -hoE '[0-9]+ processes: [0-9]+ disk cache hit.*' "$LOG" | tail -1 || true)
+          if [ -z "$line" ]; then
+            echo "bazel never printed a process summary; nothing to report"
+            exit 0
+          fi
+          echo "$line"
+          total=$(printf '%s' "$line" | sed -E 's/^([0-9]+) processes:.*/\1/')
+          hit=$(printf '%s' "$line" | sed -E 's/.*: ([0-9]+) disk cache hit.*/\1/')
+          worker=$(printf '%s' "$line" | grep -oE '[0-9]+ worker' | grep -oE '[0-9]+' || echo 0)
+          pct=0
+          [ "$total" -gt 0 ] && pct=$(( hit * 100 / total ))
+          echo "  total actions      : $total"
+          echo "  disk cache hits    : $hit (${pct}%)"
+          echo "  swift compiles run : $worker   <- branding cost"
           {
-            echo "### Bazel actions executed"
+            echo "### Bazel compile breakdown"
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| executed | $actions |"
-            echo "| log size | $size |"
+            echo "| total actions | $total |"
+            echo "| disk cache hits | $hit (${pct}%) |"
+            echo "| swift compiles run (branding cost) | $worker |"
           } >> "$GITHUB_STEP_SUMMARY"
-          rm -f "$EXECUTION_LOG"
 
       # The IPA is built and the cache has served its purpose, so empty both
       # cache paths before the job's post-job steps run. This is the ONLY thing
@@ -452,13 +457,8 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          mkdir -p "$REPO_CACHE_DIR" "$(dirname "$EXECUTION_LOG")"
-          {
-            printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR"
-            if [ "${MEASURE_BAZEL_ACTIONS:-1}" = "1" ]; then
-              printf 'build --execution_log_json_file=%s\n' "$EXECUTION_LOG"
-            fi
-          } > "$HOME/.bazelrc"
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
 
       - name: Compile unbranded tree
         id: compile
@@ -479,31 +479,6 @@ jobs:
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber=1
-
-      - name: Report total action count
-        if: always()
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          # The seed is always a cold compile, so this is the denominator: the
-          # total number of actions a full build of this tree contains. A
-          # branded build's executed count divided by this is the reuse ratio,
-          # and the difference is what branding costs. Recorded here because the
-          # seed is the only job that ever sees every action.
-          if [ ! -s "$EXECUTION_LOG" ]; then
-            echo "no execution log at $EXECUTION_LOG (measurement off, or bazel never wrote one)"
-            exit 0
-          fi
-          total=$(grep -c '' "$EXECUTION_LOG" || true)
-          echo "golden seed executed $total action(s) - this is the total action count"
-          {
-            echo "### Golden seed: total actions"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| total actions | $total |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          rm -f "$EXECUTION_LOG"
 
       - name: Measure generated caches
         id: size
