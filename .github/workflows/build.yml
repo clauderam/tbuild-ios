@@ -52,6 +52,22 @@ env:
   # the save and the restore must agree on them.
   BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
   REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
+  # How much of the tree a build actually had to compile. The golden seed
+  # reports the total action count; a branded build reports how many it
+  # executed, which is every action the unbranded cache could not serve - the
+  # branded modules plus whatever their changed outputs invalidated. Comparing
+  # the two is the only honest measure of what branding costs a build, and
+  # nothing else in this workflow reports it.
+  #
+  # Outside SOURCE_DIR so bazel never treats the log as a source file, and not
+  # under either cache directory so "Release restored cache" does not have to
+  # know about it.
+  EXECUTION_LOG: /private/var/tmp/tbuild-cache/execution-log.json
+  # Single kill switch for the measurement. The flag is written into the *user*
+  # rc file, which bazel reads after the workspace one, so it cannot collide
+  # with the tree - but an unrecognised flag fails the build, and cache
+  # handling must never be able to do that. Set this to 0 to stop writing it.
+  MEASURE_BAZEL_ACTIONS: "1"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -236,9 +252,17 @@ jobs:
           # --cacheDir maps to bazel's --disk_cache. Make.py's --bazelArguments
           # is parsed but never reaches the bazel command line, so the repository
           # cache goes through the user rc file, which bazel reads after the
-          # workspace one and which nothing in the source tree sets.
-          mkdir -p "$REPO_CACHE_DIR"
-          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
+          # workspace one and which nothing in the source tree sets. The
+          # execution log rides along in the same file, so it too needs no
+          # change to Make.py. It is an observer, not an input, so it changes
+          # no action key and cannot disturb the cache.
+          mkdir -p "$REPO_CACHE_DIR" "$(dirname "$EXECUTION_LOG")"
+          {
+            printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR"
+            if [ "${MEASURE_BAZEL_ACTIONS:-1}" = "1" ]; then
+              printf 'build --execution_log_json_file=%s\n' "$EXECUTION_LOG"
+            fi
+          } > "$HOME/.bazelrc"
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
@@ -287,6 +311,33 @@ jobs:
           path: build/artifacts/${{ steps.metadata.outputs.ipa_name }}
           if-no-files-found: error
           retention-days: 1
+
+      # Best effort, and never fatal. Counts the actions bazel actually ran,
+      # which is the exact set the unbranded cache could not serve. Compare it
+      # against the seed's total to get the reuse ratio; there is no other way
+      # to tell whether branding is costing a minute or an hour, and no other
+      # signal in this workflow would show it.
+      - name: Report compiled action count
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ ! -s "$EXECUTION_LOG" ]; then
+            echo "no execution log at $EXECUTION_LOG (measurement off, or bazel never wrote one)"
+            exit 0
+          fi
+          actions=$(grep -c '' "$EXECUTION_LOG" || true)
+          size=$(du -h "$EXECUTION_LOG" 2>/dev/null | cut -f1)
+          echo "bazel executed $actions action(s); execution log $size"
+          {
+            echo "### Bazel actions executed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| executed | $actions |"
+            echo "| log size | $size |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$EXECUTION_LOG"
 
       # The IPA is built and the cache has served its purpose, so empty both
       # cache paths before the job's post-job steps run. This is the ONLY thing
