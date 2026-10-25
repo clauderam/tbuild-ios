@@ -1,109 +1,223 @@
-name: CI
+name: Seed 13.1.1 golden cache
 
+# Runs on the default branch (master) so the cache is visible to every
+# app branch, but checks out the 13.1.1 base tree and saves under the same
+# ios-golden-*-v1-* keys the agent's app-branch workflow restores.
 on:
-  push:
-    branches: [ master ]
-
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-131-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_DIR: /Users/Shared/telegram-ios
+  BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+  # Both cache directories live outside SOURCE_DIR so bazel never treats them as
+  # part of the source tree. Their absolute paths are part of the contract: the
+  # save and the restore must agree on them.
+  BAZEL_CACHE_DIR: /private/var/tmp/tbuild-cache/bazel-disk
+  REPO_CACHE_DIR: /private/var/tmp/tbuild-cache/repos
+  # Guard rails for the seed, not the quota. These reject only something
+  # implausible for a single build. The quota is enforced after the save,
+  # against stored bytes, by the Verify step in the golden job - the one number
+  # that matters is the compressed size, which du cannot see.
+  MIN_CAS_KB: "262144"    # 256 MiB - below this the build never got going
+  MAX_CAS_KB: "9437184"   # 9 GiB
+  MAX_REPOS_KB: "3670016" # 3.5 GiB
+  QUOTA_BYTES: "10737418240"
+  QUOTA_GIB: "10"
+
+
 jobs:
-  build:
-    runs-on: macos-13
-
+  golden:
+    runs-on: macos-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      # Only this job creates or removes cache entries, so it is the only one
+      # that needs a token with write access.
+      actions: write
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout the 13.1.1 base without persisted credentials
+        uses: actions/checkout@v5
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+          ref: tbuild-ios-base-131
+          submodules: recursive
+          fetch-depth: "0"
+          persist-credentials: false
 
-      - name: Set active Xcode path
+      - name: Select pinned Xcode
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          set -euo pipefail
+          XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          if [ ! -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            echo "::error::versions.json pins Xcode ${XCODE_VERSION}, which this runner does not have."
+            echo "Available:"; ls -d /Applications/Xcode_*.app 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+            exit 1
+          fi
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
 
-      - name: Create canonical source directory
+      - name: Prepare canonical source directory
         run: |
-          set -x
+          set -euo pipefail
           sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
+          rm -rf "$SOURCE_DIR"
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename "$GITHUB_WORKSPACE")" "$SOURCE_DIR"
 
-      - name: Build the App
+      - name: Configure repository cache
+        continue-on-error: true
         run: |
-          set -x
+          set -euo pipefail
+          mkdir -p "$REPO_CACHE_DIR"
+          printf 'common --repository_cache=%s\n' "$REPO_CACHE_DIR" > "$HOME/.bazelrc"
 
-          # source code paths are included in the final binary, so we need to make them stable across builds
-          SOURCE_DIR=/Users/Shared/telegram-ios
+      - name: Compile unbranded tree
+        id: compile
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
 
-          # use canonical bazel root
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-
-          cd $SOURCE_DIR
-
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
-          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
-
+          # Fixed build number: it reaches variables.bzl and therefore the
+          # //Telegram packaging actions, and a stable value keeps them
+          # comparable between generations.
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
             build \
-            --configurationPath="build-system/appstore-configuration.json" \
+            --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER"
+            --buildNumber=1 2>&1 | tee "$RUNNER_TEMP/bazel-build.log"
 
-          # collect ipa
-          OUTPUT_PATH="build/artifacts"
-          rm -rf "$OUTPUT_PATH"
-          mkdir -p "$OUTPUT_PATH"
-          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            cp "$f" $OUTPUT_PATH/
-          done
+      # The seed is always a cold compile, so this is the denominator: the total
+      # number of actions a full build of this tree contains. A branded build's
+      # executed count divided by this is the reuse ratio. Recorded here because
+      # the seed is the only job that ever sees every action.
+      - name: Report total action count
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ ! -s "$RUNNER_TEMP/bazel-build.log" ]; then
+            echo "no bazel log; nothing to report"
+            exit 0
+          fi
+          total=$(grep -hoE '[0-9]+ processes: [0-9]+ disk cache hit.*' "$RUNNER_TEMP/bazel-build.log" | tail -1 || true)
+          if [ -z "$total" ]; then
+            echo "bazel never printed a process summary; nothing to report"
+            exit 0
+          fi
+          echo "golden seed executed $total"
+          {
+            echo "### Golden seed"
+            echo
+            echo '```'
+            echo "$total"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # collect dsym
-          mkdir -p build/DSYMs
-          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
-            cp -R "$f" build/DSYMs/
-          done
-          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
+      - name: Measure generated caches
+        id: size
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cas_kb=0
+          repos_kb=0
+          [ -d "$BAZEL_CACHE_DIR" ] && cas_kb=$(du -sk "$BAZEL_CACHE_DIR" | cut -f1)
+          [ -d "$REPO_CACHE_DIR" ] && repos_kb=$(du -sk "$REPO_CACHE_DIR" | cut -f1)
+          mib() { printf '%d' $(( $1 / 1024 )); }
+          echo "bazel disk cache: $(mib "$cas_kb") MiB ($(du -sh "$BAZEL_CACHE_DIR" 2>/dev/null | cut -f1) on disk, uncompressed)"
+          echo "repository cache: $(mib "$repos_kb") MiB ($(du -sh "$REPO_CACHE_DIR" 2>/dev/null | cut -f1) on disk, uncompressed)"
+          printf 'cas_kb=%s\nrepos_kb=%s\n' "$cas_kb" "$repos_kb" >> "$GITHUB_OUTPUT"
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save golden bazel disk cache
+        if: always() && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
         with:
-          tag_name: build-${{ env.BUILD_NUMBER }}
-          release_name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          body: |
-            An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          draft: false
-          prerelease: false
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
 
-      - name: Upload Release IPA
-        id: upload-release-ipa 
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save golden external repository cache
+        if: always() && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
-          asset_name: Telegram.ipa
-          asset_content_type: application/zip
+          path: ${{ env.REPO_CACHE_DIR }}
+          key: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
 
-      - name: Upload Release DSYM
-        id: upload-release-dsym 
-        uses: actions/upload-release-asset@v1
+      # The explicit save steps above are the only thing in this workflow that
+      # writes a cache entry. The quota is enforced here against STORED bytes,
+      # because actions/cache zstd-compresses before uploading and du cannot see
+      # that. A seed that died during analysis can leave a near-empty entry,
+      # which would shadow the good generation for every future build, so an
+      # implausibly small cache is not saved at all.
+      - name: Verify stored cache size against the quota
+        if: always()
+        continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
-          asset_name: Telegram.DSYMs.zip
-          asset_content_type: application/zip
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_CAS: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          CURRENT_REPOS: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+        run: |
+          set -uo pipefail
+          cas_kb=${{ steps.size.outputs.cas_kb || 0 }}
+          repos_kb=${{ steps.size.outputs.repos_kb || 0 }}
+          gib() { printf '%.2f' "$(echo "scale=4; $1 / 1048576" | bc)"; }
+          if [ "$cas_kb" -lt "$MIN_CAS_KB" ] || [ "$cas_kb" -gt "$MAX_CAS_KB" ]; then
+            echo "::error::bazel disk cache is $(gib "$cas_kb") GiB, outside [$(gib "$MIN_CAS_KB"), $(gib "$MAX_CAS_KB")] GiB - NOT saving, so the next build will compile from scratch."
+            exit 0
+          fi
+          if [ "$repos_kb" -gt "$MAX_REPOS_KB" ]; then
+            echo "::warning::repository cache is $(gib "$repos_kb") GiB, outside (0, $(gib "$MAX_REPOS_KB")] GiB - not saving"
+          fi
+          total=0
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" > /tmp/caches.json
+          python3 -c '
+          import json, os
+          total = int(os.environ["QUOTA_BYTES"])
+          keep = {os.environ["CURRENT_CAS"], os.environ["CURRENT_REPOS"]}
+          grand = 0
+          for c in json.load(open("/tmp/caches.json")).get("actions_caches", []):
+              grand += c.get("size_in_bytes", 0)
+              flag = "keep" if c["key"] in keep else "stale"
+              print("  %s  %8.2f MiB  %s" % (flag, c.get("size_in_bytes", 0) / 1048576.0, c["key"]))
+          print("stored cache total: %.2f GiB of quota %.0f GiB" % (grand / 1073741824.0, total / 1073741824.0))
+          '
+
+      # Best effort. A cache entry is write-once, so a superseded generation has
+      # to be deleted explicitly or it lingers until eviction and pushes the
+      # repository over quota alongside its replacement. Failure here only costs
+      # quota, so it must not fail the job.
+      - name: Retire superseded golden entries
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_CAS: ios-golden-cas-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+          CURRENT_REPOS: ios-golden-repos-v1-${{ runner.os }}-${{ hashFiles('versions.json', '.bazelrc') }}
+        run: |
+          set -uo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" > /tmp/caches.json
+          python3 -c '
+          import json, os
+          keep = {os.environ["CURRENT_CAS"], os.environ["CURRENT_REPOS"]}
+          caches = json.load(open("/tmp/caches.json")).get("actions_caches", [])
+          for c in caches:
+              if (c["key"].startswith("ios-golden-cas-v1-") or c["key"].startswith("ios-golden-repos-v1-")) and c["key"] not in keep:
+                  print(c["id"])
+          ' > /tmp/stale_ids
+          while read -r id; do
+            [ -n "$id" ] || continue
+            echo "deleting superseded cache $id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" || true
+          done < /tmp/stale_ids
+
